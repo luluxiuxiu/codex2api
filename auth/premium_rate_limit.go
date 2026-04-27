@@ -14,9 +14,19 @@ func normalizePlanType(plan string) string {
 	return strings.ToLower(strings.TrimSpace(plan))
 }
 
+func IsProFamilyPlan(plan string) bool {
+	normalized := normalizePlanType(plan)
+	return normalized == "pro" || strings.HasPrefix(normalized, "pro")
+}
+
 func isPremium5hPlan(plan string) bool {
-	switch normalizePlanType(plan) {
-	case "plus", "pro", "team":
+	normalized := normalizePlanType(plan)
+	switch {
+	case normalized == "plus":
+		return true
+	case normalized == "team" || normalized == "teamplus":
+		return true
+	case IsProFamilyPlan(normalized):
 		return true
 	default:
 		return false

@@ -296,8 +296,13 @@ func concurrencyLimitForTier(baseLimit int64, tier AccountHealthTier) int64 {
 }
 
 func defaultScoreBiasForPlan(planType string) int64 {
-	switch strings.ToLower(strings.TrimSpace(planType)) {
-	case "pro", "plus", "team":
+	normalized := normalizePlanType(planType)
+	switch {
+	case normalized == "plus":
+		return 50
+	case normalized == "team" || normalized == "teamplus":
+		return 50
+	case IsProFamilyPlan(normalized):
 		return 50
 	default:
 		return 0
@@ -1843,7 +1848,7 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 	now := time.Now()
-	_, _, limit, _, available := target.fastSchedulerSnapshot(maxConcurrency, now)
+	_, _, limit, available := target.fastSchedulerSnapshot(maxConcurrency, now)
 	if !available || limit <= 0 {
 		return nil
 	}

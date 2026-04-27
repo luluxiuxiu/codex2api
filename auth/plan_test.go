@@ -12,6 +12,7 @@ func TestIsPlusOrHigherPlan(t *testing.T) {
 		{"Free", false},
 		{"plus", true},
 		{"pro", true},
+		{"prolite", true},
 		{"team", true},
 		{"teamplus", true},
 		{"enterprise", true},

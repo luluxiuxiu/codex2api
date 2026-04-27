@@ -589,8 +589,13 @@ func effectiveScoreBias(planType string, override sql.NullInt64) int64 {
 	if override.Valid {
 		return override.Int64
 	}
-	switch strings.ToLower(strings.TrimSpace(planType)) {
-	case "pro", "plus", "team":
+	normalized := strings.ToLower(strings.TrimSpace(planType))
+	switch {
+	case normalized == "plus":
+		return 50
+	case normalized == "team" || normalized == "teamplus":
+		return 50
+	case auth.IsProFamilyPlan(normalized):
 		return 50
 	default:
 		return 0

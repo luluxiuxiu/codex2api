@@ -126,7 +126,7 @@ export default function Accounts() {
       if (plan === 'free') {
         return !has7d
       }
-      if (plan === 'pro' || plan === 'team' || plan === 'plus' || plan === 'teamplus') {
+      if (isPremiumUsagePlan(plan)) {
         return !has5h || !has7d
       }
       return !has7d
@@ -187,8 +187,7 @@ export default function Accounts() {
     }
     // 套餐过滤
     if (planFilter !== 'all') {
-      const plan = (account.plan_type || '').toLowerCase()
-      if (plan !== planFilter) return false
+      if (!matchesPlanFilter(account.plan_type, planFilter)) return false
     }
     // 搜索过滤
     if (searchQuery) {
@@ -2169,14 +2168,11 @@ function getDispatchScore(account: AccountRow): number {
 }
 
 function getDefaultScoreBias(planType?: string): number {
-  switch ((planType || '').toLowerCase()) {
-    case 'pro':
-    case 'plus':
-    case 'team':
-      return 50
-    default:
-      return 0
+  const normalized = normalizePlanType(planType)
+  if (normalized === 'plus' || normalized === 'team' || normalized === 'teamplus' || isProFamilyPlan(normalized)) {
+    return 50
   }
+  return 0
 }
 
 function getEffectiveScoreBias(account: AccountRow): number {
@@ -2705,7 +2701,7 @@ function UsageBar({ label, pct, resetAt }: { label: string; pct: number; resetAt
 
 // 用量列组件
 function UsageCell({ account }: { account: AccountRow }) {
-  const plan = (account.plan_type || '').toLowerCase()
+  const plan = normalizePlanType(account.plan_type)
   const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
   const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
 
@@ -2718,7 +2714,7 @@ function UsageCell({ account }: { account: AccountRow }) {
     )
   }
 
-  if (plan === 'pro' || plan === 'team' || plan === 'plus' || plan === 'teamplus') {
+  if (isPremiumUsagePlan(plan)) {
     if (!has5h && !has7d) return <span className="text-[12px] text-muted-foreground">-</span>
     return (
       <div className="w-48 space-y-1.5">
@@ -2736,6 +2732,32 @@ function UsageCell({ account }: { account: AccountRow }) {
     )
   }
   return <span className="text-[13px] text-muted-foreground">-</span>
+}
+
+function normalizePlanType(planType?: string): string {
+  return (planType || '').trim().toLowerCase()
+}
+
+function isProFamilyPlan(planType?: string): boolean {
+  const normalized = normalizePlanType(planType)
+  return normalized === 'pro' || normalized.startsWith('pro')
+}
+
+function isPremiumUsagePlan(planType?: string): boolean {
+  const normalized = normalizePlanType(planType)
+  return normalized === 'plus' || normalized === 'team' || normalized === 'teamplus' || isProFamilyPlan(normalized)
+}
+
+function matchesPlanFilter(planType: string | undefined, filter: 'all' | 'pro' | 'plus' | 'team' | 'free'): boolean {
+  const normalized = normalizePlanType(planType)
+  switch (filter) {
+    case 'all':
+      return true
+    case 'pro':
+      return isProFamilyPlan(normalized)
+    default:
+      return normalized === filter
+  }
 }
 
 // 冷却倒计时组件

@@ -7,16 +7,38 @@ import (
 )
 
 func newFastSchedulerTestAccount(id int64, tier AccountHealthTier, score float64, limit int64) *Account {
-	return &Account{
-		DBID:                     id,
-		AccessToken:              "token",
-		Status:                   StatusReady,
-		HealthTier:               tier,
-		SchedulerScore:           score,
-		DispatchScore:            score,
-		BaseConcurrencyEffective: limit,
-		DynamicConcurrencyLimit:  limit,
+	acc := &Account{
+		DBID:        id,
+		AccessToken: "token",
+		Status:      StatusReady,
 	}
+
+	if limit > 0 {
+		acc.BaseConcurrencyOverride = int64Ptr(limit)
+	}
+
+	now := time.Now()
+	switch tier {
+	case HealthTierWarm:
+		acc.LastFailureAt = now
+	case HealthTierRisky:
+		acc.LastUnauthorizedAt = now
+	}
+
+	acc.mu.Lock()
+	acc.recomputeSchedulerLocked(limit)
+	rawDispatchScore := acc.DispatchScore
+	acc.mu.Unlock()
+
+	if tier == HealthTierHealthy || tier == HealthTierWarm {
+		override := int64(score - rawDispatchScore)
+		acc.ScoreBiasOverride = int64Ptr(override)
+	}
+
+	acc.mu.Lock()
+	acc.recomputeSchedulerLocked(limit)
+	acc.mu.Unlock()
+	return acc
 }
 
 func TestFastSchedulerAcquirePrefersHealthyTier(t *testing.T) {
@@ -195,8 +217,7 @@ func TestFastSchedulerUpdateMovesAccountBetweenBuckets(t *testing.T) {
 	acc.Status = StatusReady
 	acc.CooldownUtil = time.Time{}
 	acc.CooldownReason = ""
-	acc.HealthTier = HealthTierWarm
-	acc.DynamicConcurrencyLimit = 1
+	acc.LastFailureAt = time.Now()
 	acc.mu.Unlock()
 	scheduler.Update(acc)
 
@@ -235,15 +256,15 @@ func TestBuildFastSchedulerFromStore(t *testing.T) {
 	}
 }
 
-func TestFastSchedulerProvenPhaseUsesTotalRequestsOnly(t *testing.T) {
-	premium := newFastSchedulerTestAccount(1, HealthTierHealthy, 150, 1)
-	atomic.StoreInt64(&premium.TotalRequests, 0)
+func TestFastSchedulerAcquireHonorsHigherDispatchScore(t *testing.T) {
+	higher := newFastSchedulerTestAccount(1, HealthTierHealthy, 150, 1)
+	atomic.StoreInt64(&higher.TotalRequests, 0)
 
-	proven := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 1)
-	atomic.StoreInt64(&proven.TotalRequests, 11)
+	provenLower := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 1)
+	atomic.StoreInt64(&provenLower.TotalRequests, 11)
 
 	scheduler := NewFastScheduler(1)
-	scheduler.Rebuild([]*Account{premium, proven})
+	scheduler.Rebuild([]*Account{higher, provenLower})
 
 	got := scheduler.Acquire()
 	if got == nil {
@@ -251,8 +272,8 @@ func TestFastSchedulerProvenPhaseUsesTotalRequestsOnly(t *testing.T) {
 	}
 	defer scheduler.Release(got)
 
-	if got.DBID != proven.DBID {
-		t.Fatalf("Acquire() picked dbID=%d, want proven account %d", got.DBID, proven.DBID)
+	if got.DBID != higher.DBID {
+		t.Fatalf("Acquire() picked dbID=%d, want higher-score account %d", got.DBID, higher.DBID)
 	}
 }
 

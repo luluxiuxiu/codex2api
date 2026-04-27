@@ -17,7 +17,6 @@ type fastSchedulerEntry struct {
 	acc           *Account
 	dbID          int64
 	dispatchScore float64
-	proven        bool
 }
 
 type fastSchedulerPosition struct {
@@ -29,17 +28,14 @@ type fastSchedulerPosition struct {
 // 它不在请求热路径内重算全量 score，而是直接复用 Account 上已缓存的
 // HealthTier / DispatchScore / DynamicConcurrencyLimit。
 //
-// 调度策略：两阶段扫描
-// 1. 优先在验证过的账号（TotalRequests > 10，排在桶前部）中 round-robin
-// 2. 验证账号全忙时，回退到全量 round-robin
+// 调度策略：按 tier 分桶，在桶内基于实时 dispatch score 选择最佳账号。
+// proven bonus 作为 score 的一部分参与排序，不再单独覆盖手工权重。
 type FastScheduler struct {
-	mu           sync.RWMutex
-	baseLimit    int64
-	buckets      map[AccountHealthTier][]fastSchedulerEntry
-	positions    map[int64]fastSchedulerPosition
-	cursors      [3]atomic.Uint64
-	provenBounds [3]int           // 每个 tier 桶中验证过的账号数量（排在前面）
-	provenCurs   [3]atomic.Uint64 // 验证账号专用 round-robin 游标
+	mu        sync.RWMutex
+	baseLimit int64
+	buckets   map[AccountHealthTier][]fastSchedulerEntry
+	positions map[int64]fastSchedulerPosition
+	cursors   [3]atomic.Uint64
 }
 
 func NewFastScheduler(baseLimit int64) *FastScheduler {
@@ -95,7 +91,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		if acc == nil || acc.DBID == 0 {
 			continue
 		}
-		tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
+		tier, dispatchScore, limit, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
 		if !available || limit <= 0 {
 			continue
 		}
@@ -106,21 +102,16 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 			acc:           acc,
 			dbID:          acc.DBID,
 			dispatchScore: dispatchScore,
-			proven:        proven,
 		})
 	}
 
-	// 每个桶只排序一次 + 重建位置索引 + 计算验证账号边界
-	for tierIdx, tier := range fastSchedulerTierOrder {
+	// 每个桶只排序一次 + 重建位置索引
+	for _, tier := range fastSchedulerTierOrder {
 		entries := s.buckets[tier]
 		if len(entries) == 0 {
-			s.provenBounds[tierIdx] = 0
 			continue
 		}
 		sort.SliceStable(entries, func(i, j int) bool {
-			if entries[i].proven != entries[j].proven {
-				return entries[i].proven
-			}
 			if entries[i].dispatchScore == entries[j].dispatchScore {
 				return entries[i].dbID < entries[j].dbID
 			}
@@ -128,7 +119,6 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		})
 		s.buckets[tier] = entries
 		s.rebuildPositionsLocked(tier)
-		s.provenBounds[tierIdx] = countProvenEntries(entries)
 	}
 }
 
@@ -171,7 +161,6 @@ func (s *FastScheduler) Acquire() *Account {
 }
 
 // AcquireExcluding 获取下一个可用账号，排除指定的账号 ID 集合
-// 两阶段调度：优先在验证过的账号中选取，全忙时回退到全量扫描
 func (s *FastScheduler) AcquireExcluding(apiKeyID int64, exclude map[int64]bool) *Account {
 	return s.AcquireExcludingWithFilter(apiKeyID, exclude, nil)
 }
@@ -195,21 +184,6 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 			if len(bucket) == 0 {
 				continue
 			}
-
-			// 阶段 1：优先在验证过的账号（桶前部 provenBound 个）中 round-robin
-			provenBound := s.provenBounds[tierIdx]
-			if provenBound > 0 {
-				acc, stale := s.scanRangeLocked(tier, 0, provenBound, &s.provenCurs[tierIdx], baseLimit, now, apiKeyID, exclude, filter)
-				if acc != nil {
-					return acc
-				}
-				if stale {
-					changed = true
-					break
-				}
-			}
-
-			// 阶段 2：回退到全量 round-robin
 			acc, stale := s.scanRangeLocked(tier, 0, len(bucket), &s.cursors[tierIdx], baseLimit, now, apiKeyID, exclude, filter)
 			if acc != nil {
 				return acc
@@ -225,7 +199,7 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 	}
 }
 
-// scanRangeLocked 在 bucket[start:end) 范围内 round-robin 扫描可用账号。
+// scanRangeLocked 在 bucket[start:end) 范围内选取当前 dispatch score 最优的账号。
 // 返回 stale=true 表示桶内缓存已过期，调用方应重新开始扫描。
 func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeStart, rangeEnd int, cursor *atomic.Uint64, baseLimit int64, now time.Time, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, bool) {
 	bucket := s.buckets[expectedTier]
@@ -234,36 +208,72 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 		return nil, false
 	}
 	start := int(cursor.Add(1)-1) % rangeLen
-	for offset := 0; offset < rangeLen; offset++ {
-		entry := bucket[rangeStart+(start+offset)%rangeLen]
-		if entry.acc == nil {
-			continue
-		}
-		if exclude != nil && exclude[entry.dbID] {
-			continue
-		}
-		if !entry.acc.AllowsAPIKey(apiKeyID) {
-			continue
-		}
-		if filter != nil && !filter(entry.acc) {
-			continue
-		}
-		tier, _, limit, _, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
-		if tier != expectedTier {
-			s.removeLocked(entry.dbID)
-			if available && limit > 0 {
-				s.insertLocked(entry.acc, now)
+	tried := make(map[int64]struct{}, rangeLen)
+
+	for len(tried) < rangeLen {
+		var bestAcc *Account
+		var bestDBID int64
+		bestDispatchScore := -1.0
+		bestLoad := int64(0)
+		bestLimit := int64(0)
+		found := false
+
+		for offset := 0; offset < rangeLen; offset++ {
+			entry := bucket[rangeStart+(start+offset)%rangeLen]
+			if entry.acc == nil {
+				continue
 			}
-			return nil, true
+			if _, seen := tried[entry.dbID]; seen {
+				continue
+			}
+			if exclude != nil && exclude[entry.dbID] {
+				continue
+			}
+			if !entry.acc.AllowsAPIKey(apiKeyID) {
+				continue
+			}
+			if filter != nil && !filter(entry.acc) {
+				continue
+			}
+
+			tier, dispatchScore, limit, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
+			if tier != expectedTier {
+				s.removeLocked(entry.dbID)
+				if available && limit > 0 {
+					s.insertLocked(entry.acc, now)
+				}
+				return nil, true
+			}
+			if !available || limit <= 0 {
+				continue
+			}
+
+			load := atomic.LoadInt64(&entry.acc.ActiveRequests)
+			if load >= limit {
+				continue
+			}
+
+			if !found ||
+				dispatchScore > bestDispatchScore ||
+				(dispatchScore == bestDispatchScore && load < bestLoad) {
+				bestAcc = entry.acc
+				bestDBID = entry.dbID
+				bestDispatchScore = dispatchScore
+				bestLoad = load
+				bestLimit = limit
+				found = true
+			}
 		}
-		if !available || limit <= 0 {
-			continue
+
+		if !found {
+			return nil, false
 		}
-		if !tryAcquireAccount(entry.acc, limit) {
-			continue
+		if tryAcquireAccount(bestAcc, bestLimit) {
+			return bestAcc, false
 		}
-		return entry.acc, false
+		tried[bestDBID] = struct{}{}
 	}
+
 	return nil, false
 }
 
@@ -293,7 +303,7 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		return
 	}
 
-	tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
+	tier, dispatchScore, limit, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
 	if !available || limit <= 0 {
 		return
 	}
@@ -305,12 +315,8 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		acc:           acc,
 		dbID:          acc.DBID,
 		dispatchScore: dispatchScore,
-		proven:        proven,
 	})
 	sort.SliceStable(entries, func(i, j int) bool {
-		if entries[i].proven != entries[j].proven {
-			return entries[i].proven
-		}
 		if entries[i].dispatchScore == entries[j].dispatchScore {
 			return entries[i].dbID < entries[j].dbID
 		}
@@ -318,13 +324,6 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 	})
 	s.buckets[tier] = entries
 	s.rebuildPositionsLocked(tier)
-	// 更新该 tier 的验证账号边界
-	for tierIdx, t := range fastSchedulerTierOrder {
-		if t == tier {
-			s.provenBounds[tierIdx] = countProvenEntries(entries)
-			break
-		}
-	}
 }
 
 func (s *FastScheduler) removeLocked(dbID int64) {
@@ -344,23 +343,6 @@ func (s *FastScheduler) removeLocked(dbID int64) {
 	s.buckets[pos.tier] = entries
 	delete(s.positions, dbID)
 	s.rebuildPositionsLocked(pos.tier)
-	// 更新该 tier 的验证账号边界
-	for tierIdx, t := range fastSchedulerTierOrder {
-		if t == pos.tier {
-			s.provenBounds[tierIdx] = countProvenEntries(entries)
-			break
-		}
-	}
-}
-
-// countProvenEntries 统计桶中验证过的账号数量（TotalRequests > 10，排在前面）
-func countProvenEntries(entries []fastSchedulerEntry) int {
-	for i, e := range entries {
-		if !e.proven {
-			return i
-		}
-	}
-	return len(entries) // 全部都是验证过的
 }
 
 func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {
@@ -372,18 +354,15 @@ func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {
 	}
 }
 
-func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (AccountHealthTier, float64, int64, bool, bool) {
+func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (AccountHealthTier, float64, int64, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if isPremium5hPlan(a.PlanType) && a.UsagePercent5hValid {
-		a.recomputeSchedulerLocked(baseLimit)
-	}
+	a.recomputeSchedulerLocked(baseLimit)
 
 	tier := a.healthTierLocked()
 	score := a.DispatchScore
 	limit := a.DynamicConcurrencyLimit
-	proven := atomic.LoadInt64(&a.TotalRequests) > 10
 
 	if score == 0 && a.SchedulerScore != 0 {
 		score = a.SchedulerScore
@@ -410,7 +389,7 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 		available = false
 	}
 
-	return tier, score, limit, proven, available
+	return tier, score, limit, available
 }
 
 func tryAcquireAccount(acc *Account, limit int64) bool {

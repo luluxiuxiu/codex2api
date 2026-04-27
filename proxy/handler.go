@@ -125,7 +125,7 @@ func accountFilterForModel(model string) auth.AccountFilter {
 		if account == nil {
 			return false
 		}
-		return strings.EqualFold(strings.TrimSpace(account.GetPlanType()), "pro")
+		return auth.IsProFamilyPlan(account.GetPlanType())
 	}
 }
 

@@ -38,6 +38,23 @@ func TestAccountPremiumPlanGetsDefaultScoreBias(t *testing.T) {
 	}
 }
 
+func TestAccountProlitePlanGetsDefaultScoreBias(t *testing.T) {
+	acc := &Account{
+		AccessToken: "token",
+		Status:      StatusReady,
+		PlanType:    "prolite",
+	}
+
+	recomputeTestAccount(acc, 6)
+
+	if acc.DispatchScore != 150 {
+		t.Fatalf("DispatchScore = %v, want 150", acc.DispatchScore)
+	}
+	if acc.ScoreBiasEffective != 50 {
+		t.Fatalf("ScoreBiasEffective = %d, want 50", acc.ScoreBiasEffective)
+	}
+}
+
 func TestAccountScoreBiasOverrideReplacesPlanDefault(t *testing.T) {
 	acc := &Account{
 		AccessToken:       "token",
@@ -118,8 +135,8 @@ func TestAccountBaseConcurrencyOverrideControlsDynamicLimit(t *testing.T) {
 
 func TestNeedsUsageProbeSkipsRateLimited(t *testing.T) {
 	acc := &Account{
-		AccessToken: "token",
-		Status:      StatusCooldown,
+		AccessToken:    "token",
+		Status:         StatusCooldown,
 		CooldownReason: "rate_limited",
 	}
 	if acc.NeedsUsageProbe(10 * time.Minute) {
@@ -129,8 +146,8 @@ func TestNeedsUsageProbeSkipsRateLimited(t *testing.T) {
 
 func TestNeedsUsageProbeSkipsUnauthorized(t *testing.T) {
 	acc := &Account{
-		AccessToken: "token",
-		Status:      StatusCooldown,
+		AccessToken:    "token",
+		Status:         StatusCooldown,
 		CooldownReason: "unauthorized",
 	}
 	if acc.NeedsUsageProbe(10 * time.Minute) {
