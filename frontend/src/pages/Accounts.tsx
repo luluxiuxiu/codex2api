@@ -1174,6 +1174,7 @@ export default function Accounts() {
                       >
                         {t('accounts.usage')} {sortKey === 'usage' ? (sortDir === 'desc' ? '↓' : '↑') : ''}
                       </TableHead>
+                      <TableHead className="text-[13px] font-semibold">{t('accounts.estimatedCost')}</TableHead>
                       <TableHead
                         className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
                         onClick={() => { if (sortKey === 'importTime') { setSortDir(d => d === 'asc' ? 'desc' : 'asc') } else { setSortKey('importTime'); setSortDir('desc') }; setPage(1) }}
@@ -1240,6 +1241,9 @@ export default function Accounts() {
                         </TableCell>
                         <TableCell>
                           <UsageCell account={account} />
+                        </TableCell>
+                        <TableCell className="min-w-[168px] text-[13px] text-foreground" title={t('accounts.estimatedCostHint')}>
+                          <EstimatedCostCell account={account} t={t} />
                         </TableCell>
                         <TableCell className="text-[13px] text-muted-foreground whitespace-nowrap">{formatBeijingTime(account.created_at)}</TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">{formatRelativeTime(account.updated_at)}</TableCell>
@@ -2226,6 +2230,46 @@ function computePreviewDynamicConcurrency(account: AccountRow, baseConcurrency: 
 function formatSignedNumber(value: number): string {
   if (value > 0) return `+${value}`
   return String(value)
+}
+
+function formatEstimatedCost(value?: number): string {
+  const amount = typeof value === 'number' && Number.isFinite(value) ? value : 0
+  if (amount <= 0) {
+    return '-'
+  }
+  if (amount >= 1) {
+    return `$${amount.toFixed(2)}`
+  }
+  if (amount >= 0.01) {
+    return `$${amount.toFixed(3)}`
+  }
+  return `$${amount.toFixed(4)}`
+}
+
+function EstimatedCostCell({
+  account,
+  t,
+}: {
+  account: AccountRow
+  t: (key: string) => string
+}) {
+  const total = account.estimated_total_cost_usd ?? 0
+  const input = account.estimated_input_cost_usd ?? 0
+  const output = account.estimated_output_cost_usd ?? 0
+  const cache = account.estimated_cache_cost_usd ?? 0
+
+  if (total <= 0 && input <= 0 && output <= 0 && cache <= 0) {
+    return <span className="text-muted-foreground">-</span>
+  }
+
+  return (
+    <div className="space-y-0.5 leading-tight">
+      <div className="text-[13px] font-semibold text-foreground">{t('accounts.estimatedCostTotal')}: {formatEstimatedCost(total)}</div>
+      <div className="text-[11px] text-muted-foreground">{t('accounts.estimatedCostInput')}: {formatEstimatedCost(input)}</div>
+      <div className="text-[11px] text-muted-foreground">{t('accounts.estimatedCostOutput')}: {formatEstimatedCost(output)}</div>
+      <div className="text-[11px] text-muted-foreground">{t('accounts.estimatedCostCache')}: {formatEstimatedCost(cache)}</div>
+    </div>
+  )
 }
 
 function CompactStat({

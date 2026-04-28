@@ -56,6 +56,11 @@ type Handler struct {
 	reqCountMu        sync.RWMutex
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
+
+	// 账号价格估算缓存（30秒 TTL）
+	costEstimateMu        sync.RWMutex
+	costEstimateCache     map[int64]database.AccountCostEstimate
+	costEstimateExpiresAt time.Time
 }
 
 type chartCacheEntry struct {
@@ -292,6 +297,10 @@ type accountResponse struct {
 	LastServerErrorAt        string                     `json:"last_server_error_at,omitempty"`
 	Locked                   bool                       `json:"locked"`
 	AllowedAPIKeyIDs         []int64                    `json:"allowed_api_key_ids"`
+	EstimatedInputCostUSD    float64                    `json:"estimated_input_cost_usd"`
+	EstimatedOutputCostUSD   float64                    `json:"estimated_output_cost_usd"`
+	EstimatedCacheCostUSD    float64                    `json:"estimated_cache_cost_usd"`
+	EstimatedTotalCostUSD    float64                    `json:"estimated_total_cost_usd"`
 }
 
 type schedulerBreakdownResponse struct {
@@ -328,6 +337,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	// 获取每账号近 7 天请求统计（带 30 秒内存缓存）
 	reqCounts := h.getCachedRequestCounts()
+	costEstimates := h.getCachedAccountCostEstimates()
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
@@ -411,6 +421,12 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if rc, ok := reqCounts[row.ID]; ok {
 			resp.SuccessRequests = rc.SuccessCount
 			resp.ErrorRequests = rc.ErrorCount
+		}
+		if estimatedCost, ok := costEstimates[row.ID]; ok {
+			resp.EstimatedInputCostUSD = estimatedCost.InputUSD
+			resp.EstimatedOutputCostUSD = estimatedCost.OutputUSD
+			resp.EstimatedCacheCostUSD = estimatedCost.CacheUSD
+			resp.EstimatedTotalCostUSD = estimatedCost.TotalUSD
 		}
 		accounts = append(accounts, resp)
 	}
@@ -692,6 +708,31 @@ func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCou
 	h.reqCountMu.Unlock()
 
 	return counts
+}
+
+func (h *Handler) getCachedAccountCostEstimates() map[int64]database.AccountCostEstimate {
+	h.costEstimateMu.RLock()
+	if h.costEstimateCache != nil && time.Now().Before(h.costEstimateExpiresAt) {
+		cached := h.costEstimateCache
+		h.costEstimateMu.RUnlock()
+		return cached
+	}
+	h.costEstimateMu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	estimates, err := h.db.GetAccountCostEstimates(ctx)
+	if err != nil {
+		log.Printf("获取账号价格估算失败: %v", err)
+		return make(map[int64]database.AccountCostEstimate)
+	}
+
+	h.costEstimateMu.Lock()
+	h.costEstimateCache = estimates
+	h.costEstimateExpiresAt = time.Now().Add(30 * time.Second)
+	h.costEstimateMu.Unlock()
+
+	return estimates
 }
 
 type addAccountReq struct {

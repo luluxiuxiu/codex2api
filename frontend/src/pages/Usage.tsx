@@ -25,13 +25,25 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon } from 'lucide-react'
+import { Activity, Box, CircleDollarSign, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
 function formatTokens(value?: number | null): string {
   if (value === undefined || value === null) return '0'
   return value.toLocaleString()
+}
+
+function formatUSD(value?: number | null): string {
+  const amount = value ?? 0
+  const absAmount = Math.abs(amount)
+  const fractionDigits = absAmount > 0 && absAmount < 0.01 ? 6 : absAmount < 1 ? 4 : 2
+  return new Intl.NumberFormat(undefined, {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits,
+  }).format(amount)
 }
 
 // Claude 模型 → Codex 模型映射（与后端 defaultAnthropicModelMap 一致）
@@ -296,6 +308,11 @@ export default function Usage() {
   const totalTokens = stats?.total_tokens ?? 0
   const totalPromptTokens = stats?.total_prompt_tokens ?? 0
   const totalCompletionTokens = stats?.total_completion_tokens ?? 0
+  const totalCachedTokens = stats?.total_cached_tokens ?? 0
+  const totalInputCost = stats?.total_input_cost_usd ?? 0
+  const totalOutputCost = stats?.total_output_cost_usd ?? 0
+  const totalCacheCost = stats?.total_cache_cost_usd ?? 0
+  const totalCost = stats?.total_cost_usd ?? 0
   const todayRequests = stats?.today_requests ?? 0
   const rpm = stats?.rpm ?? 0
   const tpm = stats?.tpm ?? 0
@@ -326,8 +343,8 @@ export default function Usage() {
           onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
         />
 
-        {/* Top stats: 2 columns */}
-        <div className="grid grid-cols-2 gap-3 mb-3 max-sm:grid-cols-1">
+        {/* Top stats: 3 columns */}
+        <div className="grid grid-cols-3 gap-3 mb-3 max-lg:grid-cols-2 max-sm:grid-cols-1">
           <Card className="py-0">
             <CardContent className="flex flex-col gap-2 p-4">
               <div className="flex items-center justify-between gap-3">
@@ -363,6 +380,24 @@ export default function Usage() {
               </div>
             </CardContent>
           </Card>
+
+          <Card className="py-0">
+            <CardContent className="flex flex-col gap-2 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalCostCard')}</span>
+                <div className="size-10 flex items-center justify-center rounded-xl bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300">
+                  <CircleDollarSign className="size-[18px]" />
+                </div>
+              </div>
+              <div className="text-[26px] font-bold leading-none">
+                {formatUSD(totalCost)}
+              </div>
+              <div className="text-[12px] text-muted-foreground leading-relaxed">
+                <div>{t('usage.inputCost')}: {formatUSD(totalInputCost)}</div>
+                <div>{t('usage.outputCost')}: {formatUSD(totalOutputCost)} <span className="mx-1">·</span> {t('usage.cacheCost')}: {formatUSD(totalCacheCost)}</div>
+              </div>
+            </CardContent>
+          </Card>
         </div>
 
         {/* Bottom stats: 3 columns */}
@@ -393,7 +428,9 @@ export default function Usage() {
               <div className="text-[26px] font-bold leading-none">
                 {formatTokens(tpm)}
               </div>
-              <div className="text-[12px] text-muted-foreground">{t('usage.tpmDesc')}</div>
+              <div className="text-[12px] text-muted-foreground">
+                {t('usage.tpmDesc')} <span className="ml-2">{t('usage.cachedTokens')}: {formatTokens(totalCachedTokens)}</span>
+              </div>
             </CardContent>
           </Card>
 

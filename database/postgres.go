@@ -183,11 +183,18 @@ func New(driver string, dsn string) (*DB, error) {
 			total_tokens    BIGINT NOT NULL DEFAULT 0,
 			prompt_tokens   BIGINT NOT NULL DEFAULT 0,
 			completion_tokens BIGINT NOT NULL DEFAULT 0,
-			cached_tokens   BIGINT NOT NULL DEFAULT 0
+			cached_tokens   BIGINT NOT NULL DEFAULT 0,
+			input_cost_usd  DOUBLE PRECISION NOT NULL DEFAULT 0,
+			output_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+			cache_cost_usd  DOUBLE PRECISION NOT NULL DEFAULT 0,
+			total_cost_usd  DOUBLE PRECISION NOT NULL DEFAULT 0
 		)
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("创建 usage_stats_baseline 表失败: %w", err)
+	}
+	if err := db.ensureUsageStatsBaselineSchema(ctx); err != nil {
+		return nil, fmt.Errorf("迁移 usage_stats_baseline 表失败: %w", err)
 	}
 
 	// 确保 baseline 行存在
@@ -197,6 +204,34 @@ func New(driver string, dsn string) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+func (db *DB) ensureUsageStatsBaselineSchema(ctx context.Context) error {
+	if db.isSQLite() {
+		columns := []struct {
+			name string
+			def  string
+		}{
+			{"input_cost_usd", "DOUBLE PRECISION NOT NULL DEFAULT 0"},
+			{"output_cost_usd", "DOUBLE PRECISION NOT NULL DEFAULT 0"},
+			{"cache_cost_usd", "DOUBLE PRECISION NOT NULL DEFAULT 0"},
+			{"total_cost_usd", "DOUBLE PRECISION NOT NULL DEFAULT 0"},
+		}
+		for _, column := range columns {
+			if err := db.ensureSQLiteColumn(ctx, "usage_stats_baseline", column.name, column.def); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	_, err := db.conn.ExecContext(ctx, `
+		ALTER TABLE usage_stats_baseline ADD COLUMN IF NOT EXISTS input_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+		ALTER TABLE usage_stats_baseline ADD COLUMN IF NOT EXISTS output_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+		ALTER TABLE usage_stats_baseline ADD COLUMN IF NOT EXISTS cache_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+		ALTER TABLE usage_stats_baseline ADD COLUMN IF NOT EXISTS total_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+	`)
+	return err
 }
 
 // Close 关闭数据库连接
@@ -1028,17 +1063,74 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) e
 
 // UsageStats 使用统计
 type UsageStats struct {
-	TotalRequests     int64   `json:"total_requests"`
-	TotalTokens       int64   `json:"total_tokens"`
-	TotalPrompt       int64   `json:"total_prompt_tokens"`
-	TotalCompletion   int64   `json:"total_completion_tokens"`
-	TotalCachedTokens int64   `json:"total_cached_tokens"`
-	TodayRequests     int64   `json:"today_requests"`
-	TodayTokens       int64   `json:"today_tokens"`
-	RPM               float64 `json:"rpm"`
-	TPM               float64 `json:"tpm"`
-	AvgDurationMs     float64 `json:"avg_duration_ms"`
-	ErrorRate         float64 `json:"error_rate"`
+	TotalRequests      int64   `json:"total_requests"`
+	TotalTokens        int64   `json:"total_tokens"`
+	TotalPrompt        int64   `json:"total_prompt_tokens"`
+	TotalCompletion    int64   `json:"total_completion_tokens"`
+	TotalCachedTokens  int64   `json:"total_cached_tokens"`
+	TotalInputCostUSD  float64 `json:"total_input_cost_usd"`
+	TotalOutputCostUSD float64 `json:"total_output_cost_usd"`
+	TotalCacheCostUSD  float64 `json:"total_cache_cost_usd"`
+	TotalCostUSD       float64 `json:"total_cost_usd"`
+	TodayRequests      int64   `json:"today_requests"`
+	TodayTokens        int64   `json:"today_tokens"`
+	RPM                float64 `json:"rpm"`
+	TPM                float64 `json:"tpm"`
+	AvgDurationMs      float64 `json:"avg_duration_ms"`
+	ErrorRate          float64 `json:"error_rate"`
+}
+
+type sqlQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
+type usageStatsBaseline struct {
+	TotalRequests    int64
+	TotalTokens      int64
+	PromptTokens     int64
+	CompletionTokens int64
+	CachedTokens     int64
+	InputCostUSD     float64
+	OutputCostUSD    float64
+	CacheCostUSD     float64
+	TotalCostUSD     float64
+}
+
+func (db *DB) getUsageStatsBaseline(ctx context.Context, queryer sqlQueryer) (usageStatsBaseline, error) {
+	var baseline usageStatsBaseline
+	err := queryer.QueryRowContext(ctx, `
+		SELECT
+			total_requests,
+			total_tokens,
+			prompt_tokens,
+			completion_tokens,
+			cached_tokens,
+			COALESCE(input_cost_usd, 0),
+			COALESCE(output_cost_usd, 0),
+			COALESCE(cache_cost_usd, 0),
+			COALESCE(total_cost_usd, 0)
+		FROM usage_stats_baseline
+		WHERE id = 1
+	`).Scan(
+		&baseline.TotalRequests,
+		&baseline.TotalTokens,
+		&baseline.PromptTokens,
+		&baseline.CompletionTokens,
+		&baseline.CachedTokens,
+		&baseline.InputCostUSD,
+		&baseline.OutputCostUSD,
+		&baseline.CacheCostUSD,
+		&baseline.TotalCostUSD,
+	)
+	if err == sql.ErrNoRows {
+		return usageStatsBaseline{}, nil
+	}
+	if err != nil {
+		return usageStatsBaseline{}, err
+	}
+	return baseline, nil
 }
 
 // TrafficSnapshot 近实时流量快照
@@ -1060,25 +1152,28 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	minuteAgo := now.Add(-1 * time.Minute)
 
-	todayQuery := `
+	aggregateQuery := `
 	SELECT
-		COUNT(*) AS today_requests,
-		COALESCE(SUM(total_tokens), 0) AS today_tokens,
-		COALESCE(SUM(prompt_tokens), 0) AS today_prompt,
-		COALESCE(SUM(completion_tokens), 0) AS today_completion,
-		COALESCE(SUM(cached_tokens), 0) AS today_cached,
+		COUNT(*) AS visible_total,
+		COALESCE(SUM(total_tokens), 0) AS visible_tokens,
+		COALESCE(SUM(prompt_tokens), 0) AS visible_prompt,
+		COALESCE(SUM(completion_tokens), 0) AS visible_completion,
+		COALESCE(SUM(cached_tokens), 0) AS visible_cached,
+		COALESCE(SUM(CASE WHEN created_at >= $1 THEN 1 ELSE 0 END), 0) AS today_requests,
+		COALESCE(SUM(CASE WHEN created_at >= $1 THEN total_tokens ELSE 0 END), 0) AS today_tokens,
 		COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0) AS rpm,
 		COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0) AS tpm,
-		COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
-		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
+		COALESCE(AVG(CASE WHEN created_at >= $1 THEN duration_ms::float8 ELSE NULL END), 0) AS avg_duration_ms,
+		COALESCE(SUM(CASE WHEN created_at >= $1 AND status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
 	FROM usage_logs
-	WHERE created_at >= $1
-	  AND status_code <> 499
+	WHERE status_code <> 499
 	`
 
+	var visibleTotal int64
 	var todayErrors int64
-	err := db.conn.QueryRowContext(ctx, todayQuery, todayStart, minuteAgo).Scan(
-		&stats.TodayRequests, &stats.TodayTokens, &stats.TotalPrompt, &stats.TotalCompletion, &stats.TotalCachedTokens,
+	err := db.conn.QueryRowContext(ctx, aggregateQuery, todayStart, minuteAgo).Scan(
+		&visibleTotal, &stats.TotalTokens, &stats.TotalPrompt, &stats.TotalCompletion, &stats.TotalCachedTokens,
+		&stats.TodayRequests, &stats.TodayTokens,
 		&stats.RPM, &stats.TPM,
 		&stats.AvgDurationMs,
 		&todayErrors,
@@ -1087,24 +1182,25 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 		return nil, err
 	}
 
-	// 统计当前可见请求总数（排除 499，保证与使用统计列表口径一致）
-	var visibleTotal int64
-	_ = db.conn.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM usage_logs WHERE status_code <> 499
-	`).Scan(&visibleTotal)
+	currentCostTotals, err := db.GetTotalUsageCostEstimate(ctx)
+	if err != nil {
+		return nil, err
+	}
 
-	// 加上基线值（清空日志前保存的累计值）
-	var bReq, bTok, bPrompt, bComp, bCached int64
-	_ = db.conn.QueryRowContext(ctx, `
-		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens
-		FROM usage_stats_baseline WHERE id = 1
-	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached)
+	baseline, err := db.getUsageStatsBaseline(ctx, db.conn)
+	if err != nil {
+		return nil, err
+	}
 
-	stats.TotalRequests = visibleTotal + bReq
-	stats.TotalTokens = stats.TodayTokens + bTok
-	stats.TotalPrompt += bPrompt
-	stats.TotalCompletion += bComp
-	stats.TotalCachedTokens += bCached
+	stats.TotalRequests = visibleTotal + baseline.TotalRequests
+	stats.TotalTokens += baseline.TotalTokens
+	stats.TotalPrompt += baseline.PromptTokens
+	stats.TotalCompletion += baseline.CompletionTokens
+	stats.TotalCachedTokens += baseline.CachedTokens
+	stats.TotalInputCostUSD = currentCostTotals.InputUSD + baseline.InputCostUSD
+	stats.TotalOutputCostUSD = currentCostTotals.OutputUSD + baseline.OutputCostUSD
+	stats.TotalCacheCostUSD = currentCostTotals.CacheUSD + baseline.CacheCostUSD
+	stats.TotalCostUSD = currentCostTotals.TotalUSD + baseline.TotalCostUSD
 
 	if stats.TodayRequests > 0 {
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
@@ -1545,30 +1641,48 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 
 // ClearUsageLogs 清空所有使用日志（先快照累计值到基线表）
 func (db *DB) ClearUsageLogs(ctx context.Context) error {
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	currentCostTotals, err := collectUsageCostEstimateTotals(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("计算使用统计费用失败: %w", err)
+	}
 	// 先将当前日志的累计值叠加到基线表
-	_, err := db.conn.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 		UPDATE usage_stats_baseline SET
 			total_requests  = total_requests  + COALESCE((SELECT COUNT(*) FROM usage_logs WHERE status_code <> 499), 0),
 			total_tokens    = total_tokens    + COALESCE((SELECT SUM(total_tokens) FROM usage_logs WHERE status_code <> 499), 0),
 			prompt_tokens   = prompt_tokens   + COALESCE((SELECT SUM(prompt_tokens) FROM usage_logs WHERE status_code <> 499), 0),
 			completion_tokens = completion_tokens + COALESCE((SELECT SUM(completion_tokens) FROM usage_logs WHERE status_code <> 499), 0),
-			cached_tokens   = cached_tokens   + COALESCE((SELECT SUM(cached_tokens) FROM usage_logs WHERE status_code <> 499), 0)
+			cached_tokens   = cached_tokens   + COALESCE((SELECT SUM(cached_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+			input_cost_usd  = input_cost_usd  + $1,
+			output_cost_usd = output_cost_usd + $2,
+			cache_cost_usd  = cache_cost_usd  + $3,
+			total_cost_usd  = total_cost_usd  + $4
 		WHERE id = 1
-	`)
+	`, currentCostTotals.InputUSD, currentCostTotals.OutputUSD, currentCostTotals.CacheUSD, currentCostTotals.TotalUSD)
 	if err != nil {
 		return fmt.Errorf("快照统计基线失败: %w", err)
 	}
 
 	// 再清空日志
 	if db.isSQLite() {
-		if _, err = db.conn.ExecContext(ctx, `DELETE FROM usage_logs`); err != nil {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM usage_logs`); err != nil {
 			return err
 		}
-		_, err = db.conn.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name = 'usage_logs'`)
+		if _, err = tx.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name = 'usage_logs'`); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	if _, err = tx.ExecContext(ctx, `TRUNCATE TABLE usage_logs RESTART IDENTITY`); err != nil {
 		return err
 	}
-	_, err = db.conn.ExecContext(ctx, `TRUNCATE TABLE usage_logs RESTART IDENTITY`)
-	return err
+	return tx.Commit()
 }
 
 // Ping 检查 PostgreSQL 连通性

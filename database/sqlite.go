@@ -595,8 +595,8 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 		SELECT created_at, total_tokens, prompt_tokens, completion_tokens,
 		       cached_tokens, duration_ms, status_code
 		FROM usage_logs
-		WHERE created_at >= $1 AND status_code <> 499
-	`, db.timeArg(todayStart))
+		WHERE status_code <> 499
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -619,21 +619,24 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 		if err != nil || createdAt.IsZero() {
 			continue
 		}
-
-		stats.TodayRequests++
-		stats.TodayTokens += totalTokens
+		stats.TotalRequests++
+		stats.TotalTokens += totalTokens
 		stats.TotalPrompt += promptTokens
 		stats.TotalCompletion += completionTokens
 		stats.TotalCachedTokens += cachedTokens
-		totalDuration += float64(durationMs)
 
-		if statusCode >= 400 {
-			todayErrors++
-		}
-		// 最近 1 分钟窗口：RPM / TPM
-		if !createdAt.Before(minuteAgo) {
-			stats.RPM++
-			stats.TPM += float64(totalTokens)
+		if !createdAt.Before(todayStart) {
+			stats.TodayRequests++
+			stats.TodayTokens += totalTokens
+			totalDuration += float64(durationMs)
+			if statusCode >= 400 {
+				todayErrors++
+			}
+			// 最近 1 分钟窗口：RPM / TPM
+			if !createdAt.Before(minuteAgo) {
+				stats.RPM++
+				stats.TPM += float64(totalTokens)
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -644,23 +647,25 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 		stats.AvgDurationMs = totalDuration / float64(stats.TodayRequests)
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
 	}
+	currentCostTotals, err := db.GetTotalUsageCostEstimate(ctx)
+	if err != nil {
+		return nil, err
+	}
 
-	// 可见请求总数（排除 499）
-	var visibleTotal int64
-	_ = db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_logs WHERE status_code <> 499`).Scan(&visibleTotal)
+	baseline, err := db.getUsageStatsBaseline(ctx, db.conn)
+	if err != nil {
+		return nil, err
+	}
 
-	// 基线值
-	var bReq, bTok, bPrompt, bComp, bCached int64
-	_ = db.conn.QueryRowContext(ctx, `
-		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens
-		FROM usage_stats_baseline WHERE id = 1
-	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached)
-
-	stats.TotalRequests = visibleTotal + bReq
-	stats.TotalTokens = stats.TodayTokens + bTok
-	stats.TotalPrompt += bPrompt
-	stats.TotalCompletion += bComp
-	stats.TotalCachedTokens += bCached
+	stats.TotalRequests += baseline.TotalRequests
+	stats.TotalTokens += baseline.TotalTokens
+	stats.TotalPrompt += baseline.PromptTokens
+	stats.TotalCompletion += baseline.CompletionTokens
+	stats.TotalCachedTokens += baseline.CachedTokens
+	stats.TotalInputCostUSD = currentCostTotals.InputUSD + baseline.InputCostUSD
+	stats.TotalOutputCostUSD = currentCostTotals.OutputUSD + baseline.OutputCostUSD
+	stats.TotalCacheCostUSD = currentCostTotals.CacheUSD + baseline.CacheCostUSD
+	stats.TotalCostUSD = currentCostTotals.TotalUSD + baseline.TotalCostUSD
 
 	return stats, nil
 }

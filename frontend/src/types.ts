@@ -53,6 +53,10 @@ export interface AccountRow {
   last_used_at?: ISODateString
   success_requests?: number
   error_requests?: number
+  estimated_input_cost_usd?: number
+  estimated_output_cost_usd?: number
+  estimated_cache_cost_usd?: number
+  estimated_total_cost_usd?: number
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
   reset_5h_at?: ISODateString
@@ -257,6 +261,10 @@ export interface UsageStats {
   total_prompt_tokens: number
   total_completion_tokens: number
   total_cached_tokens: number
+  total_input_cost_usd: number
+  total_output_cost_usd: number
+  total_cache_cost_usd: number
+  total_cost_usd: number
   today_requests: number
   today_tokens: number
   rpm: number
