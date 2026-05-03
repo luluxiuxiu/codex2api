@@ -2678,6 +2678,76 @@ func (s *Store) RefreshSingle(ctx context.Context, dbID int64) error {
 	return s.refreshAccount(ctx, target)
 }
 
+func (s *Store) applyAccessTokenRefreshResult(ctx context.Context, acc *Account, dbID int64, accessToken string, fallbackExpiry time.Time, forceFallbackExpiry bool, activeCooldown bool, cooldownUntil time.Time, cooldownReason string) {
+	atInfo := ParseAccessToken(accessToken)
+	credentials := map[string]interface{}{
+		"access_token": accessToken,
+	}
+	parsedPlanType := ""
+
+	acc.mu.Lock()
+	acc.AccessToken = accessToken
+	if atInfo != nil {
+		if !atInfo.ExpiresAt.IsZero() {
+			acc.ExpiresAt = atInfo.ExpiresAt
+		}
+		if atInfo.ChatGPTAccountID != "" {
+			acc.AccountID = atInfo.ChatGPTAccountID
+			credentials["account_id"] = atInfo.ChatGPTAccountID
+		}
+		if atInfo.Email != "" {
+			acc.Email = atInfo.Email
+			credentials["email"] = atInfo.Email
+		}
+		if atInfo.PlanType != "" {
+			acc.PlanType = atInfo.PlanType
+			credentials["plan_type"] = atInfo.PlanType
+			parsedPlanType = atInfo.PlanType
+		} else if acc.PlanType == "" {
+			log.Printf("[账号 %d] access_token 缺少 plan_type，无法识别套餐类型", dbID)
+		}
+	}
+	if forceFallbackExpiry || acc.ExpiresAt.IsZero() || time.Until(acc.ExpiresAt) < 5*time.Minute {
+		acc.ExpiresAt = fallbackExpiry
+	}
+	if !acc.ExpiresAt.IsZero() {
+		credentials["expires_at"] = acc.ExpiresAt.Format(time.RFC3339)
+	}
+	if activeCooldown {
+		acc.Status = StatusCooldown
+		acc.CooldownUtil = cooldownUntil
+		acc.CooldownReason = cooldownReason
+	} else {
+		acc.Status = StatusReady
+		acc.CooldownUtil = time.Time{}
+		acc.CooldownReason = ""
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+
+	s.fastSchedulerUpdate(acc)
+	if s.db != nil {
+		if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {
+			log.Printf("[账号 %d] 同步 access_token 元数据失败: %v", dbID, err)
+		}
+	}
+	s.autoLockPaidPlan(ctx, dbID, parsedPlanType, acc)
+}
+
+func (s *Store) autoLockPaidPlan(ctx context.Context, dbID int64, planType string, acc *Account) {
+	plan := strings.ToLower(strings.TrimSpace(planType))
+	if acc == nil || plan == "" || plan == "free" {
+		return
+	}
+	if !atomic.CompareAndSwapInt32(&acc.Locked, 0, 1) {
+		return
+	}
+	if s.db != nil {
+		_ = s.db.SetAccountLocked(ctx, dbID, true)
+	}
+	log.Printf("[账号 %d] 检测到 %s 套餐，已自动锁定", dbID, planType)
+}
+
 // AccountCount 返回账号数量
 func (s *Store) AccountCount() int {
 	s.mu.RLock()
@@ -2772,23 +2842,7 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	// 1. 尝试从缓存读取 AT
 	cachedToken, err := s.tokenCache.GetAccessToken(ctx, dbID)
 	if err == nil && cachedToken != "" {
-		acc.mu.Lock()
-		acc.AccessToken = cachedToken
-		if acc.ExpiresAt.IsZero() || time.Until(acc.ExpiresAt) < 5*time.Minute {
-			acc.ExpiresAt = time.Now().Add(30 * time.Minute)
-		}
-		if activeCooldown {
-			acc.Status = StatusCooldown
-			acc.CooldownUtil = cooldownUntil
-			acc.CooldownReason = cooldownReason
-		} else {
-			acc.Status = StatusReady
-			acc.CooldownUtil = time.Time{}
-			acc.CooldownReason = ""
-		}
-		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
-		acc.mu.Unlock()
-		s.fastSchedulerUpdate(acc)
+		s.applyAccessTokenRefreshResult(ctx, acc, dbID, cachedToken, time.Now().Add(30*time.Minute), false, activeCooldown, cooldownUntil, cooldownReason)
 		if expiredCooldown {
 			_ = s.db.ClearCooldown(ctx, dbID)
 		} else if !activeCooldown && s.db != nil {
@@ -2806,21 +2860,7 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		// 另一个进程在刷新，等待它完成
 		token, waitErr := s.tokenCache.WaitForRefreshComplete(ctx, dbID, 30*time.Second)
 		if waitErr == nil && token != "" {
-			acc.mu.Lock()
-			acc.AccessToken = token
-			acc.ExpiresAt = time.Now().Add(55 * time.Minute)
-			if activeCooldown {
-				acc.Status = StatusCooldown
-				acc.CooldownUtil = cooldownUntil
-				acc.CooldownReason = cooldownReason
-			} else {
-				acc.Status = StatusReady
-				acc.CooldownUtil = time.Time{}
-				acc.CooldownReason = ""
-			}
-			acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
-			acc.mu.Unlock()
-			s.fastSchedulerUpdate(acc)
+			s.applyAccessTokenRefreshResult(ctx, acc, dbID, token, time.Now().Add(55*time.Minute), true, activeCooldown, cooldownUntil, cooldownReason)
 			if expiredCooldown {
 				_ = s.db.ClearCooldown(ctx, dbID)
 			} else if !activeCooldown && s.db != nil {
@@ -2914,13 +2954,8 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	}
 
 	// 自动锁定 free 以上的账号（pro/plus/team/teamplus 等）
-	if info != nil && atomic.LoadInt32(&acc.Locked) == 0 {
-		plan := strings.ToLower(info.PlanType)
-		if plan != "" && plan != "free" {
-			atomic.StoreInt32(&acc.Locked, 1)
-			_ = s.db.SetAccountLocked(ctx, dbID, true)
-			log.Printf("[账号 %d] 检测到 %s 套餐，已自动锁定", dbID, info.PlanType)
-		}
+	if info != nil {
+		s.autoLockPaidPlan(ctx, dbID, info.PlanType, acc)
 	}
 
 	if expiredCooldown {

@@ -8,8 +8,52 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
+
+func TestFilterImportTokensForInsertDedupesByEmailAndPlanType(t *testing.T) {
+	tokens := []importToken{
+		{refreshToken: "rt-1", email: "User@example.com", planType: "Plus"},
+		{refreshToken: "rt-2", email: " user@example.com ", planType: " plus "},
+		{refreshToken: "rt-3", email: "user@example.com", planType: "pro"},
+	}
+
+	got, duplicates := filterImportTokensForInsert(tokens, map[string]bool{}, map[string]bool{}, map[string]bool{})
+
+	if duplicates != 1 {
+		t.Fatalf("duplicates = %d, want 1", duplicates)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2", len(got))
+	}
+	if got[0].refreshToken != "rt-1" || got[1].refreshToken != "rt-3" {
+		t.Fatalf("remaining tokens = %+v, want rt-1 and rt-3", got)
+	}
+}
+
+func TestFilterImportTokensForInsertSkipsExistingIdentity(t *testing.T) {
+	tokens := []importToken{
+		{refreshToken: "rt-1", email: "existing@example.com", planType: "plus"},
+		{refreshToken: "rt-2", email: "new@example.com", planType: "plus"},
+	}
+
+	got, duplicates := filterImportTokensForInsert(
+		tokens,
+		map[string]bool{},
+		map[string]bool{},
+		map[string]bool{
+			database.NormalizeAccountIdentityKey("existing@example.com", "plus"): true,
+		},
+	)
+
+	if duplicates != 1 {
+		t.Fatalf("duplicates = %d, want 1", duplicates)
+	}
+	if len(got) != 1 || got[0].refreshToken != "rt-2" {
+		t.Fatalf("remaining tokens = %+v, want only rt-2", got)
+	}
+}
 
 func TestParseImportJSONTokensSupportsFlatObjectWithBOM(t *testing.T) {
 	data := append([]byte{0xef, 0xbb, 0xbf}, []byte(`{"refresh_token":"rt-flat","email":"flat@example.com"}`)...)

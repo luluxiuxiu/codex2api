@@ -74,6 +74,8 @@ func (h *Handler) Messages(c *gin.Context) {
 		return
 	}
 
+	rawBody = normalizeReasoningFromModelField(rawBody)
+
 	// 验证 JSON
 	if !gjson.ValidBytes(rawBody) {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Invalid JSON in request body")

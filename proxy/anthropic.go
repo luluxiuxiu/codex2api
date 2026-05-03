@@ -204,6 +204,11 @@ func TranslateAnthropicToCodexWithModels(rawJSON []byte, modelMappingJSON string
 	}
 
 	originalModel := req.Model
+	modelSuffixEffort := ""
+	if normalizedModel, suffixEffort := splitModelReasoningSuffix(req.Model); normalizedModel != "" {
+		req.Model = normalizedModel
+		modelSuffixEffort = suffixEffort
+	}
 	codexModel := resolveAnthropicModel(req.Model, modelMappingJSON, supportedModels)
 
 	// 构建 input 数组
@@ -222,7 +227,10 @@ func TranslateAnthropicToCodexWithModels(rawJSON []byte, modelMappingJSON string
 
 	// reasoning effort（仅设置 effort，不设置 summary）
 	effort := resolveReasoningEffort(req.Thinking)
-	if effort != "" && effort != "high" {
+	if effort == "" {
+		effort = modelSuffixEffort
+	}
+	if effort != "" && (effort != "high" || modelSuffixEffort != "") {
 		out["reasoning"] = map[string]any{"effort": effort}
 	}
 

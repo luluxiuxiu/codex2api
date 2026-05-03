@@ -999,6 +999,85 @@ type importToken struct {
 	expiresAt    string
 }
 
+func normalizeImportToken(tok importToken) importToken {
+	seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
+		refreshToken: tok.refreshToken,
+		accessToken:  tok.accessToken,
+		idToken:      tok.idToken,
+		accountID:    tok.accountID,
+		email:        tok.email,
+		planType:     tok.planType,
+		expiresAtRaw: tok.expiresAt,
+	})
+
+	tok.refreshToken = seed.refreshToken
+	tok.accessToken = seed.accessToken
+	tok.idToken = seed.idToken
+	tok.accountID = seed.accountID
+	tok.email = seed.email
+	tok.planType = seed.planType
+	if tok.expiresAt == "" && !seed.expiresAt.IsZero() {
+		tok.expiresAt = seed.expiresAt.Format(time.RFC3339)
+	}
+
+	tok.name = strings.TrimSpace(tok.name)
+	if tok.name == "" {
+		tok.name = tok.email
+	}
+
+	return tok
+}
+
+func importTokenIdentityKey(tok importToken) string {
+	return database.NormalizeAccountIdentityKey(tok.email, tok.planType)
+}
+
+func filterImportTokensForInsert(tokens []importToken, existingRTs, existingATs, existingIdentityKeys map[string]bool) ([]importToken, int) {
+	seenIdentityKeys := make(map[string]bool, len(existingIdentityKeys)+len(tokens))
+	for key := range existingIdentityKeys {
+		if key != "" {
+			seenIdentityKeys[key] = true
+		}
+	}
+
+	newTokens := make([]importToken, 0, len(tokens))
+	duplicateCount := 0
+	for _, tok := range tokens {
+		switch {
+		case tok.refreshToken != "":
+			if existingRTs[tok.refreshToken] {
+				duplicateCount++
+				continue
+			}
+			if tok.accessToken != "" && existingATs[tok.accessToken] {
+				duplicateCount++
+				continue
+			}
+		case tok.accessToken != "":
+			if existingATs[tok.accessToken] {
+				duplicateCount++
+				continue
+			}
+		default:
+			duplicateCount++
+			continue
+		}
+
+		identityKey := importTokenIdentityKey(tok)
+		if identityKey != "" {
+			if seenIdentityKeys[identityKey] {
+				duplicateCount++
+				continue
+			}
+			seenIdentityKeys[identityKey] = true
+		}
+
+		newTokens = append(newTokens, tok)
+	}
+
+	return newTokens, duplicateCount
+}
+
 // jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
 type jsonAccountEntry struct {
 	RefreshToken string `json:"refresh_token"`
@@ -1313,6 +1392,9 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			}
 		}
 	}
+	for i := range unique {
+		unique[i] = normalizeImportToken(unique[i])
+	}
 
 	// 数据库去重（独立短超时）
 	dedupeCtx, dedupeCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1336,27 +1418,13 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			existingATs = make(map[string]bool)
 		}
 	}
-
-	var newTokens []importToken
-	duplicateCount := 0
-	for _, t := range unique {
-		switch {
-		case t.refreshToken != "":
-			if existingRTs[t.refreshToken] {
-				duplicateCount++
-			} else if t.accessToken != "" && existingATs[t.accessToken] {
-				duplicateCount++
-			} else {
-				newTokens = append(newTokens, t)
-			}
-		case t.accessToken != "":
-			if existingATs[t.accessToken] {
-				duplicateCount++
-			} else {
-				newTokens = append(newTokens, t)
-			}
-		}
+	existingIdentityKeys, err := h.db.GetAllAccountIdentityKeys(dedupeCtx)
+	if err != nil {
+		log.Printf("查询已有 email + plan_type 失败: %v", err)
+		existingIdentityKeys = make(map[string]bool)
 	}
+
+	newTokens, duplicateCount := filterImportTokensForInsert(unique, existingRTs, existingATs, existingIdentityKeys)
 
 	total := len(unique)
 

@@ -271,17 +271,19 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 }
 
 // extractReasoningEffort 从请求体提取推理强度
-// 支持 reasoning.effort（Responses API）和 reasoning_effort（Chat Completions API）
+// 支持 reasoning.effort（Responses API）、reasoning_effort（Chat Completions API）
+// 以及 model(high) 这类模型名后缀写法。
 func extractReasoningEffort(body []byte) string {
 	// Responses API: reasoning.effort
-	if effort := gjson.GetBytes(body, "reasoning.effort").String(); effort != "" {
+	if effort := normalizeReasoningEffort(gjson.GetBytes(body, "reasoning.effort").String()); effort != "" {
 		return effort
 	}
 	// Chat Completions API: reasoning_effort
-	if effort := gjson.GetBytes(body, "reasoning_effort").String(); effort != "" {
+	if effort := normalizeReasoningEffort(gjson.GetBytes(body, "reasoning_effort").String()); effort != "" {
 		return effort
 	}
-	return ""
+	_, effort := splitModelReasoningSuffix(gjson.GetBytes(body, "model").String())
+	return effort
 }
 
 // extractServiceTier 从请求体提取服务等级
@@ -619,6 +621,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 
+	rawBody = normalizeReasoningFromModelField(rawBody)
+	rawBody = normalizeServiceTierField(rawBody)
+
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRules()
@@ -652,7 +657,6 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 
-	rawBody = normalizeServiceTierField(rawBody)
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
@@ -1003,6 +1007,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 
+	rawBody = normalizeReasoningFromModelField(rawBody)
+	rawBody = normalizeServiceTierField(rawBody)
+
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRules()
@@ -1036,7 +1043,6 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 
-	rawBody = normalizeServiceTierField(rawBody)
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
@@ -1209,6 +1215,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+
+	rawBody = normalizeReasoningFromModelField(rawBody)
+	rawBody = normalizeServiceTierField(rawBody)
 
 	// Validate request
 	validator := api.NewValidator(rawBody)

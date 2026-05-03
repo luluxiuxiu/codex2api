@@ -265,6 +265,15 @@ func accountEmailFromRawCredentials(raw interface{}) string {
 	return credentialString(raw, "email")
 }
 
+func NormalizeAccountIdentityKey(email, planType string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	planType = strings.ToLower(strings.TrimSpace(planType))
+	if email == "" || planType == "" {
+		return ""
+	}
+	return email + "\x00" + planType
+}
+
 func (db *DB) isSQLite() bool {
 	return db != nil && db.driver == "sqlite"
 }

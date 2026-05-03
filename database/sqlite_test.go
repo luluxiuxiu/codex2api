@@ -131,6 +131,66 @@ func TestSoftDeleteAccountMarksDeletedStatus(t *testing.T) {
 	}
 }
 
+func TestGetAllAccountIdentityKeysIgnoresDeletedAccounts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	id1, err := db.InsertAccount(ctx, "primary", "rt-primary", "")
+	if err != nil {
+		t.Fatalf("InsertAccount primary 返回错误: %v", err)
+	}
+	if err := db.UpdateCredentials(ctx, id1, map[string]interface{}{
+		"email":     "User@Example.com",
+		"plan_type": "Plus",
+	}); err != nil {
+		t.Fatalf("UpdateCredentials primary 返回错误: %v", err)
+	}
+
+	id2, err := db.InsertAccount(ctx, "duplicate-case", "rt-duplicate", "")
+	if err != nil {
+		t.Fatalf("InsertAccount duplicate-case 返回错误: %v", err)
+	}
+	if err := db.UpdateCredentials(ctx, id2, map[string]interface{}{
+		"email":     " user@example.com ",
+		"plan_type": " plus ",
+	}); err != nil {
+		t.Fatalf("UpdateCredentials duplicate-case 返回错误: %v", err)
+	}
+
+	id3, err := db.InsertAccount(ctx, "deleted", "rt-deleted", "")
+	if err != nil {
+		t.Fatalf("InsertAccount deleted 返回错误: %v", err)
+	}
+	if err := db.UpdateCredentials(ctx, id3, map[string]interface{}{
+		"email":     "deleted@example.com",
+		"plan_type": "pro",
+	}); err != nil {
+		t.Fatalf("UpdateCredentials deleted 返回错误: %v", err)
+	}
+	if err := db.SoftDeleteAccount(ctx, id3); err != nil {
+		t.Fatalf("SoftDeleteAccount 返回错误: %v", err)
+	}
+
+	keys, err := db.GetAllAccountIdentityKeys(ctx)
+	if err != nil {
+		t.Fatalf("GetAllAccountIdentityKeys 返回错误: %v", err)
+	}
+
+	if len(keys) != 1 {
+		t.Fatalf("len(keys) = %d, want 1; keys=%v", len(keys), keys)
+	}
+	if !keys[NormalizeAccountIdentityKey("user@example.com", "plus")] {
+		t.Fatalf("missing normalized identity key, got %v", keys)
+	}
+}
+
 func TestSQLiteMigratesLegacyDeletedAccounts(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	ctx := context.Background()

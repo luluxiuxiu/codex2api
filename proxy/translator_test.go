@@ -71,6 +71,45 @@ func TestTranslateRequest_PreservesSupportedServiceTier(t *testing.T) {
 	}
 }
 
+func TestTranslateRequest_ModelSuffixSetsReasoningEffort(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4-mini(High)",
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if model := gjson.GetBytes(got, "model").String(); model != "gpt-5.4-mini" {
+		t.Fatalf("model mismatch: got %q want %q", model, "gpt-5.4-mini")
+	}
+	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "high" {
+		t.Fatalf("reasoning.effort mismatch: got %q want %q", effort, "high")
+	}
+}
+
+func TestTranslateRequest_ExplicitReasoningEffortOverridesModelSuffix(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4-mini(high)",
+		"reasoning_effort":"low",
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if model := gjson.GetBytes(got, "model").String(); model != "gpt-5.4-mini" {
+		t.Fatalf("model mismatch: got %q want %q", model, "gpt-5.4-mini")
+	}
+	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "low" {
+		t.Fatalf("reasoning.effort mismatch: got %q want %q", effort, "low")
+	}
+}
+
 func TestTranslateRequest_FillsMissingArrayItemsInToolSchema(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -160,6 +199,22 @@ func TestPrepareResponsesBody_DefaultsIncludeForResponses(t *testing.T) {
 	}
 	if instructions := gjson.GetBytes(got, "instructions").String(); !strings.Contains(instructions, codexImageGenerationBridgeMarker) {
 		t.Fatalf("expected bridge instructions, got %q", instructions)
+	}
+}
+
+func TestPrepareResponsesBody_ModelSuffixSetsReasoningEffort(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4-mini(xhigh)",
+		"input":"test"
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if model := gjson.GetBytes(got, "model").String(); model != "gpt-5.4-mini" {
+		t.Fatalf("model mismatch: got %q want %q", model, "gpt-5.4-mini")
+	}
+	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "xhigh" {
+		t.Fatalf("reasoning.effort mismatch: got %q want %q", effort, "xhigh")
 	}
 }
 

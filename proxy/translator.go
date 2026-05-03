@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -611,6 +612,13 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 		"include": []string{"reasoning.encrypted_content"},
 	}
 
+	if normalizedModel, suffixEffort := splitModelReasoningSuffix(req.Model); normalizedModel != "" {
+		out["model"] = normalizedModel
+		if req.ReasoningEffort == "" {
+			req.ReasoningEffort = suffixEffort
+		}
+	}
+
 	// 1. messages → input
 	out["input"] = convertMessagesToInputSlice(req.Messages)
 
@@ -647,6 +655,8 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return rawBody, ""
 	}
+
+	normalizeReasoningFromModelMap(body)
 
 	// 1. 强制设置 Codex 必需字段
 	body["stream"] = true
@@ -788,10 +798,11 @@ func PrepareCompactResponsesBody(rawBody []byte) ([]byte, string) {
 
 // normalizeReasoningEffort 将 reasoning_effort 钳位到上游支持的值
 func normalizeReasoningEffort(effort string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
 	if effort == "" {
 		return ""
 	}
-	switch strings.ToLower(effort) {
+	switch effort {
 	case "low", "medium", "high", "xhigh":
 		return effort
 	default:
@@ -999,6 +1010,69 @@ func normalizeServiceTierField(body []byte) []byte {
 	body, _ = sjson.SetBytes(body, "service_tier", tier)
 	body, _ = sjson.DeleteBytes(body, "serviceTier")
 	return body
+}
+
+var modelReasoningSuffixPattern = regexp.MustCompile(`(?i)^(.*?)(?:\s*\((low|medium|high|xhigh)\))\s*$`)
+
+func splitModelReasoningSuffix(model string) (string, string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "", ""
+	}
+	matches := modelReasoningSuffixPattern.FindStringSubmatch(model)
+	if len(matches) != 3 {
+		return model, ""
+	}
+	baseModel := strings.TrimSpace(matches[1])
+	effort := normalizeReasoningEffort(matches[2])
+	if baseModel == "" || effort == "" {
+		return model, ""
+	}
+	return baseModel, effort
+}
+
+func normalizeReasoningFromModelField(body []byte) []byte {
+	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	baseModel, suffixEffort := splitModelReasoningSuffix(model)
+	if suffixEffort == "" || baseModel == "" {
+		return body
+	}
+
+	if baseModel != model {
+		body, _ = sjson.SetBytes(body, "model", baseModel)
+	}
+
+	if normalizeReasoningEffort(gjson.GetBytes(body, "reasoning.effort").String()) == "" &&
+		normalizeReasoningEffort(gjson.GetBytes(body, "reasoning_effort").String()) == "" {
+		body, _ = sjson.SetBytes(body, "reasoning_effort", suffixEffort)
+	}
+
+	return body
+}
+
+func normalizeReasoningFromModelMap(body map[string]any) {
+	if body == nil {
+		return
+	}
+
+	model, _ := body["model"].(string)
+	baseModel, suffixEffort := splitModelReasoningSuffix(model)
+	if suffixEffort == "" || baseModel == "" {
+		return
+	}
+
+	body["model"] = baseModel
+
+	if reasoning, ok := body["reasoning"].(map[string]any); ok {
+		if effort, ok := reasoning["effort"].(string); ok && normalizeReasoningEffort(effort) != "" {
+			return
+		}
+	}
+	if effort, ok := body["reasoning_effort"].(string); ok && normalizeReasoningEffort(effort) != "" {
+		return
+	}
+
+	body["reasoning_effort"] = suffixEffort
 }
 
 func sanitizeServiceTierForUpstream(body []byte) []byte {

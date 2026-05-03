@@ -2,6 +2,18 @@ package database
 
 import "testing"
 
+func TestNormalizeAccountIdentityKey(t *testing.T) {
+	got := NormalizeAccountIdentityKey(" User@Example.com ", " Plus ")
+	want := "user@example.com\x00plus"
+	if got != want {
+		t.Fatalf("NormalizeAccountIdentityKey() = %q, want %q", got, want)
+	}
+
+	if got := NormalizeAccountIdentityKey("user@example.com", ""); got != "" {
+		t.Fatalf("expected empty key when plan_type missing, got %q", got)
+	}
+}
+
 func TestAccountRowGetCredentialInt64SliceNormalizesValues(t *testing.T) {
 	row := &AccountRow{
 		Credentials: map[string]interface{}{

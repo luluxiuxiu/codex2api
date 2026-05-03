@@ -1,8 +1,13 @@
 package auth
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/codex2api/cache"
+	"github.com/codex2api/database"
 )
 
 func int64Ptr(v int64) *int64 {
@@ -130,6 +135,94 @@ func TestAccountBaseConcurrencyOverrideControlsDynamicLimit(t *testing.T) {
 	}
 	if acc.DynamicConcurrencyLimit != 1 {
 		t.Fatalf("risky DynamicConcurrencyLimit = %d, want 1", acc.DynamicConcurrencyLimit)
+	}
+}
+
+func TestRefreshSingleUpdatesPlanTypeFromCachedAccessToken(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	accountID, err := db.InsertAccount(ctx, "cached-plan", "rt-old", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 返回错误: %v", err)
+	}
+	if err := db.UpdateCredentials(ctx, accountID, map[string]interface{}{
+		"access_token": "old-token",
+		"email":        "old@example.com",
+		"plan_type":    "plus",
+		"expires_at":   time.Now().Add(30 * time.Minute).Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("seed credentials: %v", err)
+	}
+
+	tokenExpiry := time.Now().Add(time.Hour).Truncate(time.Second)
+	cachedToken := makeTestJWT(map[string]interface{}{
+		"exp": tokenExpiry.Unix(),
+		"https://api.openai.com/auth": map[string]interface{}{
+			"chatgpt_account_id": "acc-free",
+			"chatgpt_plan_type":  "free",
+		},
+		"https://api.openai.com/profile": map[string]interface{}{
+			"email": "free@example.com",
+		},
+	})
+	tokenCache := cache.NewMemory(1)
+	defer tokenCache.Close()
+	if err := tokenCache.SetAccessToken(ctx, accountID, cachedToken, time.Hour); err != nil {
+		t.Fatalf("SetAccessToken 返回错误: %v", err)
+	}
+
+	store := NewStore(db, tokenCache, nil)
+	acc := &Account{
+		DBID:         accountID,
+		RefreshToken: "rt-old",
+		AccessToken:  "old-token",
+		PlanType:     "plus",
+		Status:       StatusReady,
+		HealthTier:   HealthTierHealthy,
+	}
+	store.AddAccount(acc)
+
+	if err := store.RefreshSingle(ctx, accountID); err != nil {
+		t.Fatalf("RefreshSingle 返回错误: %v", err)
+	}
+
+	acc.mu.RLock()
+	planType := acc.PlanType
+	email := acc.Email
+	expiresAt := acc.ExpiresAt
+	scoreBias := acc.ScoreBiasEffective
+	acc.mu.RUnlock()
+	if planType != "free" {
+		t.Fatalf("runtime PlanType = %q, want free", planType)
+	}
+	if email != "free@example.com" {
+		t.Fatalf("runtime Email = %q, want free@example.com", email)
+	}
+	if !expiresAt.Equal(tokenExpiry) {
+		t.Fatalf("runtime ExpiresAt = %s, want %s", expiresAt.Format(time.RFC3339), tokenExpiry.Format(time.RFC3339))
+	}
+	if scoreBias != 0 {
+		t.Fatalf("ScoreBiasEffective = %d, want 0 after free plan", scoreBias)
+	}
+
+	row, err := db.GetAccountByID(ctx, accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID 返回错误: %v", err)
+	}
+	if got := row.GetCredential("plan_type"); got != "free" {
+		t.Fatalf("db plan_type = %q, want free", got)
+	}
+	if got := row.GetCredential("email"); got != "free@example.com" {
+		t.Fatalf("db email = %q, want free@example.com", got)
+	}
+	if got := row.GetCredential("account_id"); got != "acc-free" {
+		t.Fatalf("db account_id = %q, want acc-free", got)
 	}
 }
 
