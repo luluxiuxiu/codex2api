@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
-import { getTimeRangeISO } from '../components/DashboardUsageCharts'
-import type { TimeRangeKey } from '../components/DashboardUsageCharts'
+import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
@@ -25,46 +24,13 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, CircleDollarSign, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
 function formatTokens(value?: number | null): string {
   if (value === undefined || value === null) return '0'
   return value.toLocaleString()
-}
-
-function formatUSD(value?: number | null): string {
-  const amount = value ?? 0
-  const absAmount = Math.abs(amount)
-  const fractionDigits = absAmount > 0 && absAmount < 0.01 ? 6 : absAmount < 1 ? 4 : 2
-  return new Intl.NumberFormat(undefined, {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: fractionDigits,
-    maximumFractionDigits: fractionDigits,
-  }).format(amount)
-}
-
-// Claude 模型 → Codex 模型映射（与后端 defaultAnthropicModelMap 一致）
-const CLAUDE_MODEL_MAP: Record<string, string> = {
-  'claude-opus-4-6': 'gpt-5.4',
-  'claude-opus-4-6-20250610': 'gpt-5.4',
-  'claude-haiku-4-5-20251001': 'gpt-5.4-mini',
-  'claude-haiku-4-5': 'gpt-5.4-mini',
-  'claude-sonnet-4-6': 'gpt-5.3-codex',
-  'claude-sonnet-4-5-20250929': 'gpt-5.2',
-  'claude-opus-4-5-20251101': 'gpt-5.3-codex',
-  'claude-sonnet-4-5-20250514': 'gpt-5.4',
-  'claude-sonnet-4-5': 'gpt-5.4',
-  'claude-sonnet-4-20250514': 'gpt-5.4',
-  'claude-sonnet-4': 'gpt-5.4',
-  'claude-opus-4-20250514': 'gpt-5.4',
-  'claude-opus-4': 'gpt-5.4',
-}
-
-function getCodexModel(model: string): string {
-  return CLAUDE_MODEL_MAP[model] || 'gpt-5.4'
 }
 
 function getStatusBadgeClassName(statusCode: number): string {
@@ -129,6 +95,100 @@ function imageResolution(log: UsageLog): string {
   return log.image_size || ''
 }
 
+function safeNumber(value?: number | null): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+function formatUSD(value?: number | null, digits = 6): string {
+  return `$${safeNumber(value).toFixed(digits)}`
+}
+
+function formatCostCardValue(value?: number | null): string {
+  const amount = safeNumber(value)
+  if (amount >= 100) {
+    return `$${amount.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+  }
+  if (amount >= 1) {
+    return `$${amount.toFixed(2)}`
+  }
+  if (amount >= 0.01) {
+    return `$${amount.toFixed(4)}`
+  }
+  return `$${amount.toFixed(6)}`
+}
+
+function formatTokenPricePerMillion(value?: number | null): string {
+  return `$${safeNumber(value).toFixed(4)} / 1M Token`
+}
+
+function UsageCostCell({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const accountBilled = safeNumber(log.account_billed)
+  const userBilled = safeNumber(log.user_billed)
+  const totalCost = safeNumber(log.total_cost)
+  const displayCost = userBilled > 0 ? userBilled : accountBilled
+  const hasCostContext = log.status_code < 400 && (
+    accountBilled > 0 ||
+    userBilled > 0 ||
+    totalCost > 0 ||
+    log.input_tokens > 0 ||
+    log.output_tokens > 0 ||
+    log.cached_tokens > 0
+  )
+
+  if (!hasCostContext) {
+    return <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
+  }
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className="group inline-flex cursor-help items-center gap-1.5 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <span className="text-[13px] font-semibold leading-none tabular-nums text-emerald-600 antialiased dark:text-emerald-400">
+            {formatUSD(displayCost)}
+          </span>
+          <Info className="size-3.5 shrink-0 text-muted-foreground transition-colors group-hover:text-blue-500" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="right" sideOffset={8} className="w-72 max-w-none whitespace-nowrap rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs text-slate-50 shadow-xl">
+        <div className="space-y-1.5">
+          <div className="mb-1 text-xs font-semibold text-slate-300">{t('usage.costDetails')}</div>
+          {log.input_cost > 0 && (
+            <CostTooltipRow label={t('usage.inputCost')} value={formatUSD(log.input_cost)} />
+          )}
+          {log.output_cost > 0 && (
+            <CostTooltipRow label={t('usage.outputCost')} value={formatUSD(log.output_cost)} />
+          )}
+          {log.cached_tokens > 0 && (
+            <CostTooltipRow label={t('usage.cacheReadCost')} value={formatUSD(log.cache_read_cost)} />
+          )}
+          {log.input_tokens > 0 && (
+            <CostTooltipRow label={t('usage.inputUnitPrice')} value={formatTokenPricePerMillion(log.input_price_per_mtoken)} valueClassName="text-sky-300" />
+          )}
+          {log.output_tokens > 0 && (
+            <CostTooltipRow label={t('usage.outputUnitPrice')} value={formatTokenPricePerMillion(log.output_price_per_mtoken)} valueClassName="text-violet-300" />
+          )}
+          {log.cached_tokens > 0 && log.cache_read_price_per_mtoken > 0 && (
+            <CostTooltipRow label={t('usage.cacheReadUnitPrice')} value={formatTokenPricePerMillion(log.cache_read_price_per_mtoken)} valueClassName="text-cyan-300" />
+          )}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function CostTooltipRow({ label, value, valueClassName = 'font-medium text-white' }: { label: string; value: string; valueClassName?: string }) {
+  return (
+    <div className="flex items-center justify-between gap-6">
+      <span className="text-slate-400">{label}</span>
+      <span className={`font-geist-mono tabular-nums ${valueClassName}`}>{value}</span>
+    </div>
+  )
+}
+
 function ImageUsageBadge({ log }: { log: UsageLog }) {
   const { t } = useTranslation()
   const rows = [
@@ -165,6 +225,42 @@ function ImageUsageBadge({ log }: { log: UsageLog }) {
           )) : (
             <div className="text-background/70">{t('usage.imageTooltipNoDetails')}</div>
           )}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function StatusCodeBadge({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const badge = (
+    <Badge
+      variant="outline"
+      className={`${usageTableBadgeClass} ${getStatusBadgeClassName(log.status_code)} ${log.status_code !== 200 ? 'cursor-help ring-1 ring-inset ring-current/10' : ''}`}
+    >
+      {log.status_code}
+    </Badge>
+  )
+
+  if (log.status_code === 200) {
+    return badge
+  }
+
+  const message = log.error_message?.trim() || t('usage.statusErrorEmpty')
+  const title = t('usage.statusErrorDetails')
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span tabIndex={0} aria-label={`${log.status_code} ${message}`} className="inline-flex focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+          {badge}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="right" sideOffset={8} className="max-w-[360px] rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs text-slate-50 shadow-xl">
+        <div className="space-y-1.5">
+          <div className="font-semibold text-slate-300">{title}</div>
+          <div className="font-geist-mono text-[11px] tabular-nums text-slate-400">HTTP {log.status_code}</div>
+          <div className="whitespace-pre-wrap break-words leading-relaxed text-slate-50">{message}</div>
         </div>
       </TooltipContent>
     </Tooltip>
@@ -313,7 +409,10 @@ export default function Usage() {
   const totalOutputCost = stats?.total_output_cost_usd ?? 0
   const totalCacheCost = stats?.total_cache_cost_usd ?? 0
   const totalCost = stats?.total_cost_usd ?? 0
+  const totalAccountBilled = stats?.total_account_billed ?? 0
+  const totalUserBilled = stats?.total_user_billed ?? 0
   const todayRequests = stats?.today_requests ?? 0
+  const todayUserBilled = stats?.today_user_billed ?? 0
   const rpm = stats?.rpm ?? 0
   const tpm = stats?.tpm ?? 0
   const errorRate = stats?.error_rate ?? 0
@@ -389,12 +488,14 @@ export default function Usage() {
                   <CircleDollarSign className="size-[18px]" />
                 </div>
               </div>
-              <div className="text-[26px] font-bold leading-none">
-                {formatUSD(totalCost)}
+              <div className="text-[26px] font-bold leading-none tabular-nums text-emerald-600 dark:text-emerald-400">
+                {formatCostCardValue(totalUserBilled > 0 ? totalUserBilled : totalCost)}
               </div>
               <div className="text-[12px] text-muted-foreground leading-relaxed">
-                <div>{t('usage.inputCost')}: {formatUSD(totalInputCost)}</div>
-                <div>{t('usage.outputCost')}: {formatUSD(totalOutputCost)} <span className="mx-1">·</span> {t('usage.cacheCost')}: {formatUSD(totalCacheCost)}</div>
+                <span>{t('usage.todayCost')}: {formatCostCardValue(todayUserBilled)}</span>
+                <span className="ml-2">{t('usage.accountCost')}: {formatCostCardValue(totalAccountBilled)}</span>
+                <div>{t('usage.inputCost')}: {formatUSD(totalInputCost)} <span className="mx-1">·</span> {t('usage.outputCost')}: {formatUSD(totalOutputCost)}</div>
+                <div>{t('usage.cacheCost')}: {formatUSD(totalCacheCost)} <span className="mx-1">·</span> {t('usage.estimatedCost')}: {formatUSD(totalCost)}</div>
               </div>
             </CardContent>
           </Card>
@@ -627,6 +728,7 @@ export default function Usage() {
                       <TableHead className={usageTableHeadClass}>{t('usage.tableEndpoint')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableType')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableToken')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableCost')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableCached')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableFirstToken')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableDuration')}</TableHead>
@@ -638,21 +740,16 @@ export default function Usage() {
                       return (
                       <TableRow key={log.id}>
                         <TableCell>
-                          <Badge
-                            variant="outline"
-                            className={`${usageTableBadgeClass} ${getStatusBadgeClassName(log.status_code)}`}
-                          >
-                            {log.status_code}
-                          </Badge>
+                          <StatusCodeBadge log={log} />
                         </TableCell>
                         <TableCell>
                           <div className="flex items-center gap-1.5 flex-wrap">
                             <Badge variant="outline" className={usageTableBadgeClass}>
                               {log.model || '-'}
                             </Badge>
-                            {log.model && log.model.startsWith('claude') && (
+                            {log.effective_model && log.effective_model !== log.model && (
                               <Badge variant="outline" className="text-[11px] font-medium border-transparent bg-blue-500/10 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400">
-                                → {getCodexModel(log.model)}
+                                → {log.effective_model}
                               </Badge>
                             )}
                             {log.reasoning_effort && (
@@ -730,6 +827,9 @@ export default function Usage() {
                           ) : (
                             <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
                           )}
+                        </TableCell>
+                        <TableCell>
+                          <UsageCostCell log={log} />
                         </TableCell>
                         <TableCell>
                           {log.cached_tokens > 0 ? (

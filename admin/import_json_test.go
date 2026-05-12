@@ -19,7 +19,7 @@ func TestFilterImportTokensForInsertDedupesByEmailAndPlanType(t *testing.T) {
 		{refreshToken: "rt-3", email: "user@example.com", planType: "pro"},
 	}
 
-	got, duplicates := filterImportTokensForInsert(tokens, map[string]bool{}, map[string]bool{}, map[string]bool{})
+	got, duplicates := filterImportTokensForInsert(tokens, map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{})
 
 	if duplicates != 1 {
 		t.Fatalf("duplicates = %d, want 1", duplicates)
@@ -40,6 +40,7 @@ func TestFilterImportTokensForInsertSkipsExistingIdentity(t *testing.T) {
 
 	got, duplicates := filterImportTokensForInsert(
 		tokens,
+		map[string]bool{},
 		map[string]bool{},
 		map[string]bool{},
 		map[string]bool{

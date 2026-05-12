@@ -57,6 +57,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			reasoning_tokens INTEGER DEFAULT 0,
 			first_token_ms INTEGER DEFAULT 0,
 			reasoning_effort TEXT DEFAULT '',
+			effective_model TEXT DEFAULT '',
 			inbound_endpoint TEXT DEFAULT '',
 			upstream_endpoint TEXT DEFAULT '',
 			stream INTEGER DEFAULT 0,
@@ -70,13 +71,22 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			image_height INTEGER DEFAULT 0,
 			image_bytes INTEGER DEFAULT 0,
 			image_format TEXT DEFAULT '',
-			image_size TEXT DEFAULT ''
+			image_size TEXT DEFAULT '',
+			error_message TEXT DEFAULT ''
 		);`,
 		`CREATE TABLE IF NOT EXISTS api_keys (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT DEFAULT '',
 			key TEXT NOT NULL UNIQUE,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS account_model_cooldowns (
+			account_id INTEGER NOT NULL,
+			model TEXT NOT NULL,
+			reason TEXT DEFAULT '',
+			reset_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (account_id, model)
 		);`,
 		`CREATE TABLE IF NOT EXISTS system_settings (
 					id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -97,9 +107,17 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				auto_clean_error INTEGER DEFAULT 0,
 				auto_clean_expired INTEGER DEFAULT 0,
 				proxy_pool_enabled INTEGER DEFAULT 0,
-			fast_scheduler_enabled INTEGER DEFAULT 0,
+				fast_scheduler_enabled INTEGER DEFAULT 0,
 				max_retries INTEGER DEFAULT 2,
-				allow_remote_migration INTEGER DEFAULT 0
+				max_rate_limit_retries INTEGER DEFAULT 1,
+				allow_remote_migration INTEGER DEFAULT 0,
+				client_compat_mode TEXT DEFAULT 'preserve',
+				codex_min_cli_version TEXT DEFAULT '0.118.0',
+				usage_log_mode TEXT DEFAULT 'full',
+				usage_log_batch_size INTEGER DEFAULT 200,
+				usage_log_flush_interval_seconds INTEGER DEFAULT 5,
+				stream_flush_policy TEXT DEFAULT 'immediate',
+				stream_flush_interval_ms INTEGER DEFAULT 20
 			);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -182,6 +200,24 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			revised_prompt TEXT DEFAULT '',
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
+		`CREATE TABLE IF NOT EXISTS prompt_filter_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			source TEXT DEFAULT '',
+			endpoint TEXT DEFAULT '',
+			model TEXT DEFAULT '',
+			action TEXT DEFAULT '',
+			mode TEXT DEFAULT '',
+			score INTEGER DEFAULT 0,
+			threshold_value INTEGER DEFAULT 0,
+			matched_patterns TEXT DEFAULT '[]',
+			text_preview TEXT DEFAULT '',
+			api_key_id INTEGER DEFAULT 0,
+			api_key_name TEXT DEFAULT '',
+			api_key_masked TEXT DEFAULT '',
+			client_ip TEXT DEFAULT '',
+			error_code TEXT DEFAULT ''
+		);`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
@@ -204,6 +240,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "reasoning_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "first_token_ms", "INTEGER DEFAULT 0"},
 		{"usage_logs", "reasoning_effort", "TEXT DEFAULT ''"},
+		{"usage_logs", "effective_model", "TEXT DEFAULT ''"},
 		{"usage_logs", "inbound_endpoint", "TEXT DEFAULT ''"},
 		{"usage_logs", "upstream_endpoint", "TEXT DEFAULT ''"},
 		{"usage_logs", "stream", "INTEGER DEFAULT 0"},
@@ -218,6 +255,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "image_bytes", "INTEGER DEFAULT 0"},
 		{"usage_logs", "image_format", "TEXT DEFAULT ''"},
 		{"usage_logs", "image_size", "TEXT DEFAULT ''"},
+		{"usage_logs", "account_billed", "REAL DEFAULT 0"},
+		{"usage_logs", "user_billed", "REAL DEFAULT 0"},
+		{"usage_logs", "is_retry_attempt", "INTEGER DEFAULT 0"},
+		{"usage_logs", "attempt_index", "INTEGER DEFAULT 0"},
+		{"usage_logs", "upstream_error_kind", "TEXT DEFAULT ''"},
+		{"usage_logs", "error_message", "TEXT DEFAULT ''"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
 		{"system_settings", "auto_clean_unauthorized", "INTEGER DEFAULT 0"},
@@ -232,11 +275,33 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "proxy_pool_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "fast_scheduler_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
+		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
 		{"system_settings", "model_mapping", "TEXT DEFAULT '{}'"},
 		{"system_settings", "resin_url", "TEXT DEFAULT ''"},
 		{"system_settings", "resin_platform_name", "TEXT DEFAULT ''"},
+		{"system_settings", "prompt_filter_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "prompt_filter_mode", "TEXT DEFAULT 'monitor'"},
+		{"system_settings", "prompt_filter_threshold", "INTEGER DEFAULT 50"},
+		{"system_settings", "prompt_filter_strict_threshold", "INTEGER DEFAULT 90"},
+		{"system_settings", "prompt_filter_log_matches", "INTEGER DEFAULT 1"},
+		{"system_settings", "prompt_filter_max_text_length", "INTEGER DEFAULT 81920"},
+		{"system_settings", "prompt_filter_sensitive_words", "TEXT DEFAULT ''"},
+		{"system_settings", "prompt_filter_custom_patterns", "TEXT DEFAULT '[]'"},
+		{"system_settings", "prompt_filter_disabled_patterns", "TEXT DEFAULT '[]'"},
+		{"system_settings", "client_compat_mode", "TEXT DEFAULT 'preserve'"},
+		{"system_settings", "codex_min_cli_version", "TEXT DEFAULT '0.118.0'"},
+		{"system_settings", "usage_log_mode", "TEXT DEFAULT 'full'"},
+		{"system_settings", "usage_log_batch_size", "INTEGER DEFAULT 200"},
+		{"system_settings", "usage_log_flush_interval_seconds", "INTEGER DEFAULT 5"},
+		{"system_settings", "stream_flush_policy", "TEXT DEFAULT 'immediate'"},
+		{"system_settings", "stream_flush_interval_ms", "INTEGER DEFAULT 20"},
+		{"accounts", "enabled", "INTEGER DEFAULT 1"},
 		{"accounts", "locked", "INTEGER DEFAULT 0"},
+		{"accounts", "image_quota_remaining", "INTEGER NULL"},
+		{"accounts", "image_quota_total", "INTEGER NULL"},
+		{"accounts", "today_used_count", "INTEGER DEFAULT 0"},
+		{"accounts", "image_quota_reset_at", "TEXT NULL"},
 		{"proxies", "test_ip", "TEXT DEFAULT ''"},
 		{"proxies", "test_location", "TEXT DEFAULT ''"},
 		{"proxies", "test_latency_ms", "INTEGER DEFAULT 0"},
@@ -256,6 +321,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_image_prompt_templates_updated ON image_prompt_templates(updated_at);`,
@@ -264,6 +330,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_image_generation_jobs_status ON image_generation_jobs(status, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_image_assets_created ON image_assets(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_image_assets_job_id ON image_assets(job_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_created_at ON prompt_filter_logs(created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_action_created_at ON prompt_filter_logs(action, created_at);`,
 	}
 	for _, stmt := range indexStatements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
@@ -593,7 +661,7 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 
 	rows, err := db.conn.QueryContext(ctx, `
 		SELECT created_at, total_tokens, prompt_tokens, completion_tokens,
-		       cached_tokens, duration_ms, status_code
+		       cached_tokens, duration_ms, status_code, account_billed, user_billed
 		FROM usage_logs
 		WHERE status_code <> 499
 	`)
@@ -605,14 +673,16 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	stats := &UsageStats{}
 	var todayErrors int64
 	var totalDuration float64
+	var currentAccountBilled, currentUserBilled float64
 
 	for rows.Next() {
 		var createdRaw interface{}
 		var totalTokens, promptTokens, completionTokens, cachedTokens int64
 		var durationMs int
 		var statusCode int
+		var accountBilled, userBilled float64
 		if err := rows.Scan(&createdRaw, &totalTokens, &promptTokens, &completionTokens,
-			&cachedTokens, &durationMs, &statusCode); err != nil {
+			&cachedTokens, &durationMs, &statusCode, &accountBilled, &userBilled); err != nil {
 			return nil, err
 		}
 		createdAt, err := parseDBTimeValue(createdRaw)
@@ -624,10 +694,14 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 		stats.TotalPrompt += promptTokens
 		stats.TotalCompletion += completionTokens
 		stats.TotalCachedTokens += cachedTokens
+		currentAccountBilled += accountBilled
+		currentUserBilled += userBilled
 
 		if !createdAt.Before(todayStart) {
 			stats.TodayRequests++
 			stats.TodayTokens += totalTokens
+			stats.TodayAccountBilled += accountBilled
+			stats.TodayUserBilled += userBilled
 			totalDuration += float64(durationMs)
 			if statusCode >= 400 {
 				todayErrors++
@@ -666,6 +740,8 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	stats.TotalOutputCostUSD = currentCostTotals.OutputUSD + baseline.OutputCostUSD
 	stats.TotalCacheCostUSD = currentCostTotals.CacheUSD + baseline.CacheCostUSD
 	stats.TotalCostUSD = currentCostTotals.TotalUSD + baseline.TotalCostUSD
+	stats.TotalAccountBilled = currentAccountBilled + baseline.AccountBilled
+	stats.TotalUserBilled = currentUserBilled + baseline.UserBilled
 
 	return stats, nil
 }
