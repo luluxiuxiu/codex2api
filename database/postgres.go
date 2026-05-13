@@ -309,6 +309,9 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 				prompt_tokens   BIGINT NOT NULL DEFAULT 0,
 				completion_tokens BIGINT NOT NULL DEFAULT 0,
 				cached_tokens   BIGINT NOT NULL DEFAULT 0,
+				cache_hit_requests BIGINT NOT NULL DEFAULT 0,
+				first_token_ms_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+				first_token_samples BIGINT NOT NULL DEFAULT 0,
 				account_billed  DOUBLE PRECISION NOT NULL DEFAULT 0,
 				user_billed     DOUBLE PRECISION NOT NULL DEFAULT 0
 			)
@@ -341,6 +344,9 @@ func (db *DB) ensureUsageStatsBaselineBillingColumns(ctx context.Context) error 
 		}{
 			{name: "account_billed", def: "REAL NOT NULL DEFAULT 0"},
 			{name: "user_billed", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "cache_hit_requests", def: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "first_token_ms_sum", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "first_token_samples", def: "INTEGER NOT NULL DEFAULT 0"},
 		} {
 			if _, ok := columns[column.name]; ok {
 				continue
@@ -354,6 +360,9 @@ func (db *DB) ensureUsageStatsBaselineBillingColumns(ctx context.Context) error 
 	_, err := db.conn.ExecContext(ctx, `
 		ALTER TABLE usage_stats_baseline ADD COLUMN IF NOT EXISTS account_billed DOUBLE PRECISION NOT NULL DEFAULT 0;
 		ALTER TABLE usage_stats_baseline ADD COLUMN IF NOT EXISTS user_billed DOUBLE PRECISION NOT NULL DEFAULT 0;
+		ALTER TABLE usage_stats_baseline ADD COLUMN IF NOT EXISTS cache_hit_requests BIGINT NOT NULL DEFAULT 0;
+		ALTER TABLE usage_stats_baseline ADD COLUMN IF NOT EXISTS first_token_ms_sum DOUBLE PRECISION NOT NULL DEFAULT 0;
+		ALTER TABLE usage_stats_baseline ADD COLUMN IF NOT EXISTS first_token_samples BIGINT NOT NULL DEFAULT 0;
 	`)
 	return err
 }
@@ -1833,16 +1842,20 @@ type UsageStats struct {
 	TotalPrompt        int64               `json:"total_prompt_tokens"`
 	TotalCompletion    int64               `json:"total_completion_tokens"`
 	TotalCachedTokens  int64               `json:"total_cached_tokens"`
+	TotalCacheRate     float64             `json:"total_cache_rate"`
 	TotalAccountBilled float64             `json:"total_account_billed"`
 	TotalUserBilled    float64             `json:"total_user_billed"`
 	AvgAccountBilled   float64             `json:"avg_account_billed_per_request"`
 	AvgUserBilled      float64             `json:"avg_user_billed_per_request"`
 	TodayRequests      int64               `json:"today_requests"`
 	TodayTokens        int64               `json:"today_tokens"`
+	TodayCachedTokens  int64               `json:"today_cached_tokens"`
+	TodayCacheRate     float64             `json:"today_cache_rate"`
 	TodayAccountBilled float64             `json:"today_account_billed"`
 	TodayUserBilled    float64             `json:"today_user_billed"`
 	RPM                float64             `json:"rpm"`
 	TPM                float64             `json:"tpm"`
+	AvgFirstTokenMs    float64             `json:"avg_first_token_ms"`
 	AvgDurationMs      float64             `json:"avg_duration_ms"`
 	ErrorRate          float64             `json:"error_rate"`
 	FeatureStats       UsageFeatureStat    `json:"feature_stats"`
@@ -1918,14 +1931,16 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	SELECT
 		COUNT(*) AS today_requests,
 		COALESCE(SUM(total_tokens), 0) AS today_tokens,
-			COALESCE(SUM(prompt_tokens), 0) AS today_prompt,
-			COALESCE(SUM(completion_tokens), 0) AS today_completion,
-			COALESCE(SUM(cached_tokens), 0) AS today_cached,
-			COALESCE(SUM(account_billed), 0) AS today_account_billed,
-			COALESCE(SUM(user_billed), 0) AS today_user_billed,
-			COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0) AS rpm,
-			COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0) AS tpm,
-			COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
+		COALESCE(SUM(prompt_tokens), 0) AS today_prompt,
+		COALESCE(SUM(completion_tokens), 0) AS today_completion,
+		COALESCE(SUM(cached_tokens), 0) AS today_cached,
+		COALESCE(SUM(account_billed), 0) AS today_account_billed,
+		COALESCE(SUM(user_billed), 0) AS today_user_billed,
+		COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0) AS rpm,
+		COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0) AS tpm,
+		COALESCE(AVG(NULLIF(first_token_ms, 0)), 0) AS avg_first_token_ms,
+		COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
+		COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0) AS today_cache_hit_requests,
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
 	FROM usage_logs
 	WHERE created_at >= $1
@@ -1933,12 +1948,15 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	`
 
 	var todayErrors int64
+	var todayCacheHitRequests int64
 	var todayPrompt, todayCompletion, todayCached int64
 	err := db.conn.QueryRowContext(ctx, todayQuery, todayStart, minuteAgo).Scan(
 		&stats.TodayRequests, &stats.TodayTokens, &todayPrompt, &todayCompletion, &todayCached,
 		&stats.TodayAccountBilled, &stats.TodayUserBilled,
 		&stats.RPM, &stats.TPM,
+		&stats.AvgFirstTokenMs,
 		&stats.AvgDurationMs,
+		&todayCacheHitRequests,
 		&todayErrors,
 	)
 	if err != nil {
@@ -1947,7 +1965,10 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 
 	// 统计当前可见请求总数和计费总额（排除 499，保证与使用统计列表口径一致）
 	var visibleTotal int64
+	var visibleCacheHitRequests int64
+	var visibleFirstTokenSamples int64
 	var currentTokens, currentPrompt, currentCompletion, currentCached int64
+	var currentFirstTokenMsSum float64
 	var currentAccountBilled, currentUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
 			SELECT
@@ -1956,27 +1977,41 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 				COALESCE(SUM(prompt_tokens), 0),
 				COALESCE(SUM(completion_tokens), 0),
 				COALESCE(SUM(cached_tokens), 0),
+				COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END), 0),
 				COALESCE(SUM(account_billed), 0),
 				COALESCE(SUM(user_billed), 0)
 			FROM usage_logs
 			WHERE status_code <> 499
-		`).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &currentAccountBilled, &currentUserBilled)
+		`).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &visibleCacheHitRequests, &currentFirstTokenMsSum, &visibleFirstTokenSamples, &currentAccountBilled, &currentUserBilled)
 
 	// 加上基线值（清空日志前保存的累计值）
-	var bReq, bTok, bPrompt, bComp, bCached int64
+	var bReq, bTok, bPrompt, bComp, bCached, bCacheHitRequests, bFirstTokenSamples int64
+	var bFirstTokenMsSum float64
 	var bAccountBilled, bUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
-			SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, account_billed, user_billed
+			SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, cache_hit_requests, first_token_ms_sum, first_token_samples, account_billed, user_billed
 			FROM usage_stats_baseline WHERE id = 1
-		`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bAccountBilled, &bUserBilled)
+		`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bCacheHitRequests, &bFirstTokenMsSum, &bFirstTokenSamples, &bAccountBilled, &bUserBilled)
 
 	stats.TotalRequests = visibleTotal + bReq
 	stats.TotalTokens = currentTokens + bTok
 	stats.TotalPrompt = currentPrompt + bPrompt
 	stats.TotalCompletion = currentCompletion + bComp
 	stats.TotalCachedTokens = currentCached + bCached
+	stats.TodayCachedTokens = todayCached
 	stats.TotalAccountBilled = currentAccountBilled + bAccountBilled
 	stats.TotalUserBilled = currentUserBilled + bUserBilled
+	if stats.TodayRequests > 0 {
+		stats.TodayCacheRate = float64(todayCacheHitRequests) / float64(stats.TodayRequests) * 100
+	}
+	if stats.TotalRequests > 0 {
+		stats.TotalCacheRate = float64(visibleCacheHitRequests+bCacheHitRequests) / float64(stats.TotalRequests) * 100
+	}
+	if totalFirstTokenSamples := visibleFirstTokenSamples + bFirstTokenSamples; totalFirstTokenSamples > 0 {
+		stats.AvgFirstTokenMs = (currentFirstTokenMsSum + bFirstTokenMsSum) / float64(totalFirstTokenSamples)
+	}
 	if stats.TotalRequests > 0 {
 		stats.AvgAccountBilled = stats.TotalAccountBilled / float64(stats.TotalRequests)
 		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
@@ -2773,12 +2808,15 @@ func (db *DB) ClearUsageLogs(ctx context.Context) error {
 	_, err := db.conn.ExecContext(ctx, `
 		UPDATE usage_stats_baseline SET
 			total_requests  = total_requests  + COALESCE((SELECT COUNT(*) FROM usage_logs WHERE status_code <> 499), 0),
-				total_tokens    = total_tokens    + COALESCE((SELECT SUM(total_tokens) FROM usage_logs WHERE status_code <> 499), 0),
-				prompt_tokens   = prompt_tokens   + COALESCE((SELECT SUM(prompt_tokens) FROM usage_logs WHERE status_code <> 499), 0),
-				completion_tokens = completion_tokens + COALESCE((SELECT SUM(completion_tokens) FROM usage_logs WHERE status_code <> 499), 0),
-				cached_tokens   = cached_tokens   + COALESCE((SELECT SUM(cached_tokens) FROM usage_logs WHERE status_code <> 499), 0),
-				account_billed  = account_billed  + COALESCE((SELECT SUM(account_billed) FROM usage_logs WHERE status_code <> 499), 0),
-				user_billed     = user_billed     + COALESCE((SELECT SUM(user_billed) FROM usage_logs WHERE status_code <> 499), 0)
+			total_tokens    = total_tokens    + COALESCE((SELECT SUM(total_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+			prompt_tokens   = prompt_tokens   + COALESCE((SELECT SUM(prompt_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+			completion_tokens = completion_tokens + COALESCE((SELECT SUM(completion_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+			cached_tokens   = cached_tokens   + COALESCE((SELECT SUM(cached_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+			cache_hit_requests = cache_hit_requests + COALESCE((SELECT SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END) FROM usage_logs WHERE status_code <> 499), 0),
+			first_token_ms_sum = first_token_ms_sum + COALESCE((SELECT SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END) FROM usage_logs WHERE status_code <> 499), 0),
+			first_token_samples = first_token_samples + COALESCE((SELECT SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END) FROM usage_logs WHERE status_code <> 499), 0),
+			account_billed  = account_billed  + COALESCE((SELECT SUM(account_billed) FROM usage_logs WHERE status_code <> 499), 0),
+			user_billed     = user_billed     + COALESCE((SELECT SUM(user_billed) FROM usage_logs WHERE status_code <> 499), 0)
 			WHERE id = 1
 		`)
 	if err != nil {

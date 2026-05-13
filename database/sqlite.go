@@ -703,7 +703,7 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 
 	rows, err := db.conn.QueryContext(ctx, `
 			SELECT created_at, total_tokens, prompt_tokens, completion_tokens,
-			       cached_tokens, duration_ms, status_code, account_billed, user_billed
+			       cached_tokens, first_token_ms, duration_ms, status_code, account_billed, user_billed
 			FROM usage_logs
 			WHERE created_at >= $1 AND status_code <> 499
 		`, db.timeArg(todayStart))
@@ -715,15 +715,18 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	stats := &UsageStats{}
 	var todayErrors int64
 	var totalDuration float64
+	var totalFirstTokenMs float64
+	var totalFirstTokenSamples int64
+	var todayCacheHitRequests int64
 
 	for rows.Next() {
 		var createdRaw interface{}
 		var totalTokens, promptTokens, completionTokens, cachedTokens int64
-		var durationMs int
+		var firstTokenMs, durationMs int
 		var statusCode int
 		var accountBilled, userBilled float64
 		if err := rows.Scan(&createdRaw, &totalTokens, &promptTokens, &completionTokens,
-			&cachedTokens, &durationMs, &statusCode, &accountBilled, &userBilled); err != nil {
+			&cachedTokens, &firstTokenMs, &durationMs, &statusCode, &accountBilled, &userBilled); err != nil {
 			return nil, err
 		}
 		createdAt, err := parseDBTimeValue(createdRaw)
@@ -736,9 +739,17 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 		stats.TotalPrompt += promptTokens
 		stats.TotalCompletion += completionTokens
 		stats.TotalCachedTokens += cachedTokens
+		stats.TodayCachedTokens += cachedTokens
 		stats.TodayAccountBilled += accountBilled
 		stats.TodayUserBilled += userBilled
 		totalDuration += float64(durationMs)
+		if firstTokenMs > 0 {
+			totalFirstTokenMs += float64(firstTokenMs)
+			totalFirstTokenSamples++
+		}
+		if cachedTokens > 0 {
+			todayCacheHitRequests++
+		}
 
 		if statusCode >= 400 {
 			todayErrors++
@@ -756,11 +767,16 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	if stats.TodayRequests > 0 {
 		stats.AvgDurationMs = totalDuration / float64(stats.TodayRequests)
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
+		stats.TodayCacheRate = float64(todayCacheHitRequests) / float64(stats.TodayRequests) * 100
+	}
+	if totalFirstTokenSamples > 0 {
+		stats.AvgFirstTokenMs = totalFirstTokenMs / float64(totalFirstTokenSamples)
 	}
 
 	// 可见请求总数（排除 499）
-	var visibleTotal int64
+	var visibleTotal, visibleCacheHitRequests, visibleFirstTokenSamples int64
 	var currentTokens, currentPrompt, currentCompletion, currentCached int64
+	var currentFirstTokenMsSum float64
 	var currentAccountBilled, currentUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
 		SELECT
@@ -769,19 +785,23 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 			COALESCE(SUM(prompt_tokens), 0),
 			COALESCE(SUM(completion_tokens), 0),
 			COALESCE(SUM(cached_tokens), 0),
+			COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(account_billed), 0),
 			COALESCE(SUM(user_billed), 0)
 		FROM usage_logs
 		WHERE status_code <> 499
-	`).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &currentAccountBilled, &currentUserBilled)
+	`).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &visibleCacheHitRequests, &currentFirstTokenMsSum, &visibleFirstTokenSamples, &currentAccountBilled, &currentUserBilled)
 
 	// 基线值
-	var bReq, bTok, bPrompt, bComp, bCached int64
+	var bReq, bTok, bPrompt, bComp, bCached, bCacheHitRequests, bFirstTokenSamples int64
+	var bFirstTokenMsSum float64
 	var bAccountBilled, bUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
-		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, account_billed, user_billed
+		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, cache_hit_requests, first_token_ms_sum, first_token_samples, account_billed, user_billed
 		FROM usage_stats_baseline WHERE id = 1
-	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bAccountBilled, &bUserBilled)
+	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bCacheHitRequests, &bFirstTokenMsSum, &bFirstTokenSamples, &bAccountBilled, &bUserBilled)
 
 	stats.TotalRequests = visibleTotal + bReq
 	stats.TotalTokens = currentTokens + bTok
@@ -790,6 +810,12 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	stats.TotalCachedTokens = currentCached + bCached
 	stats.TotalAccountBilled = currentAccountBilled + bAccountBilled
 	stats.TotalUserBilled = currentUserBilled + bUserBilled
+	if stats.TotalRequests > 0 {
+		stats.TotalCacheRate = float64(visibleCacheHitRequests+bCacheHitRequests) / float64(stats.TotalRequests) * 100
+	}
+	if visibleFirstTokenSamples+bFirstTokenSamples > 0 {
+		stats.AvgFirstTokenMs = (currentFirstTokenMsSum + bFirstTokenMsSum) / float64(visibleFirstTokenSamples+bFirstTokenSamples)
+	}
 	if stats.TotalRequests > 0 {
 		stats.AvgAccountBilled = stats.TotalAccountBilled / float64(stats.TotalRequests)
 		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
