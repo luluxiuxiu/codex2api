@@ -116,6 +116,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		return
 	}
 	accountFilter := accountFilterForModel(effectiveModel)
+	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(codexBody)
@@ -261,6 +262,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		var readErr error
 		var writeErr error
 		wroteAnyBody := false
+		var terminalFailurePayload []byte
 
 		if isStream {
 			// 流式响应：逐事件翻译为 Anthropic SSE
@@ -285,9 +287,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				eventType := parsed.Get("type").String()
 
 				// TTFT 跟踪
-				if !ttftRecorded && (eventType == "response.output_text.delta" ||
-					eventType == "response.reasoning_summary_text.delta" ||
-					eventType == "response.reasoning_text.delta") {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -303,6 +303,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
+					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 				}
 
@@ -348,7 +349,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
-				if !ttftRecorded && strings.Contains(eventType, ".delta") {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -362,6 +363,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					return false
 				}
 				if eventType == "response.failed" {
+					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 					return false
 				}
@@ -379,6 +381,9 @@ func (h *Handler) Messages(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		if len(terminalFailurePayload) > 0 {
+			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重试 (attempt %d/%d, account %d, /v1/messages): %s",
 				attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
@@ -427,6 +432,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+			logInput.UpstreamErrorKind = outcome.failureKind
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens

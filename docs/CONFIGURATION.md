@@ -69,6 +69,7 @@ Codex2API 采用三层配置架构：
 | `DATABASE_USER` | 是 | - | PostgreSQL 用户名 |
 | `DATABASE_PASSWORD` | 是 | - | PostgreSQL 密码 |
 | `DATABASE_NAME` | 是 | - | PostgreSQL 数据库名 |
+| `DATABASE_SCHEMA` | 否 | - | PostgreSQL schema；适合 Supabase 等多项目共享 database 的场景。配置后启动时自动 `CREATE SCHEMA IF NOT EXISTS` 并将所有连接的 `search_path` 指向该 schema。仅允许字母/数字/下划线，长度 ≤63；留空保持默认（通常是 `public`）。|
 | `DATABASE_SSLMODE` | 否 | disable | SSL 模式: disable/require/verify-full |
 
 ### 生图工作台
@@ -133,7 +134,7 @@ Codex2API 采用三层配置架构：
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `TestModel` | string | "gpt-5.4" | 测试连接使用的模型 |
+| `TestModel` | string | "gpt-5.5" | 测试连接使用的模型 |
 | `TestConcurrency` | int | 50 | 批量测试并发数，范围 1-200 |
 
 ### 代理配置

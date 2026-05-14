@@ -17,6 +17,7 @@ type fastSchedulerEntry struct {
 	acc           *Account
 	dbID          int64
 	dispatchScore float64
+	proven        bool
 }
 
 type fastSchedulerPosition struct {
@@ -31,11 +32,12 @@ type fastSchedulerPosition struct {
 // 调度策略：按 tier 分桶，在桶内基于实时 dispatch score 选择最佳账号。
 // proven bonus 作为 score 的一部分参与排序，不再单独覆盖手工权重。
 type FastScheduler struct {
-	mu        sync.RWMutex
-	baseLimit int64
-	buckets   map[AccountHealthTier][]fastSchedulerEntry
-	positions map[int64]fastSchedulerPosition
-	cursors   [3]atomic.Uint64
+	mu         sync.RWMutex
+	baseLimit  int64
+	buckets    map[AccountHealthTier][]fastSchedulerEntry
+	positions  map[int64]fastSchedulerPosition
+	cursors    [3]atomic.Uint64
+	groupCheck func(apiKeyID int64, account *Account) bool
 }
 
 func NewFastScheduler(baseLimit int64) *FastScheduler {
@@ -51,6 +53,15 @@ func NewFastScheduler(baseLimit int64) *FastScheduler {
 		},
 		positions: make(map[int64]fastSchedulerPosition),
 	}
+}
+
+func (s *FastScheduler) SetGroupCheck(check func(apiKeyID int64, account *Account) bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.groupCheck = check
+	s.mu.Unlock()
 }
 
 // BuildFastScheduler 用当前 Store 快照构建一个独立 scheduler。
@@ -91,7 +102,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		if acc == nil || acc.DBID == 0 {
 			continue
 		}
-		tier, dispatchScore, limit, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
+		tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
 		if !available || limit <= 0 {
 			continue
 		}
@@ -102,6 +113,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 			acc:           acc,
 			dbID:          acc.DBID,
 			dispatchScore: dispatchScore,
+			proven:        proven,
 		})
 	}
 
@@ -113,6 +125,9 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		}
 		sort.SliceStable(entries, func(i, j int) bool {
 			if entries[i].dispatchScore == entries[j].dispatchScore {
+				if entries[i].proven != entries[j].proven {
+					return entries[i].proven
+				}
 				return entries[i].dbID < entries[j].dbID
 			}
 			return entries[i].dispatchScore > entries[j].dispatchScore
@@ -216,6 +231,7 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 		bestDispatchScore := -1.0
 		bestLoad := int64(0)
 		bestLimit := int64(0)
+		bestProven := false
 		found := false
 
 		for offset := 0; offset < rangeLen; offset++ {
@@ -232,11 +248,14 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 			if !entry.acc.AllowsAPIKey(apiKeyID) {
 				continue
 			}
+			if s.groupCheck != nil && !s.groupCheck(apiKeyID, entry.acc) {
+				continue
+			}
 			if filter != nil && !filter(entry.acc) {
 				continue
 			}
 
-			tier, dispatchScore, limit, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
+			tier, dispatchScore, limit, proven, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
 			if tier != expectedTier {
 				s.removeLocked(entry.dbID)
 				if available && limit > 0 {
@@ -255,12 +274,14 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 
 			if !found ||
 				dispatchScore > bestDispatchScore ||
-				(dispatchScore == bestDispatchScore && load < bestLoad) {
+				(dispatchScore == bestDispatchScore && load < bestLoad) ||
+				(dispatchScore == bestDispatchScore && load == bestLoad && proven && !bestProven) {
 				bestAcc = entry.acc
 				bestDBID = entry.dbID
 				bestDispatchScore = dispatchScore
 				bestLoad = load
 				bestLimit = limit
+				bestProven = proven
 				found = true
 			}
 		}
@@ -303,7 +324,7 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		return
 	}
 
-	tier, dispatchScore, limit, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
+	tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
 	if !available || limit <= 0 {
 		return
 	}
@@ -315,9 +336,13 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		acc:           acc,
 		dbID:          acc.DBID,
 		dispatchScore: dispatchScore,
+		proven:        proven,
 	})
 	sort.SliceStable(entries, func(i, j int) bool {
 		if entries[i].dispatchScore == entries[j].dispatchScore {
+			if entries[i].proven != entries[j].proven {
+				return entries[i].proven
+			}
 			return entries[i].dbID < entries[j].dbID
 		}
 		return entries[i].dispatchScore > entries[j].dispatchScore
@@ -354,7 +379,7 @@ func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {
 	}
 }
 
-func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (AccountHealthTier, float64, int64, bool) {
+func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (AccountHealthTier, float64, int64, bool, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -363,11 +388,12 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 	tier := a.healthTierLocked()
 	score := a.DispatchScore
 	limit := a.DynamicConcurrencyLimit
+	proven := atomic.LoadInt64(&a.TotalRequests) > 10
 
 	if score == 0 && a.SchedulerScore != 0 {
 		score = a.SchedulerScore
 	}
-	if score == 0 && tier != HealthTierBanned && a.AccessToken != "" && a.Status != StatusError {
+	if score == 0 && tier != HealthTierBanned && a.hasDispatchCredentialLocked() && a.Status != StatusError {
 		rawScore := 100.0
 		appliedBias := a.effectiveScoreBiasLocked(now, tier)
 		score = rawScore + float64(appliedBias)
@@ -380,7 +406,7 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 		limit = concurrencyLimitForTier(baseConcurrencyEffective, tier)
 	}
 
-	available := a.Status != StatusError && tier != HealthTierBanned && a.AccessToken != ""
+	available := a.Status != StatusError && tier != HealthTierBanned && a.hasDispatchCredentialLocked()
 	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
 		available = false
 	}
@@ -395,7 +421,7 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 		available = false
 	}
 
-	return tier, score, limit, available
+	return tier, score, limit, proven, available
 }
 
 func tryAcquireAccount(acc *Account, limit int64) bool {
